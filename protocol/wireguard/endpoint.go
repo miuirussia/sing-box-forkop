@@ -14,6 +14,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/transport/phobos"
 	"github.com/sagernet/sing-box/transport/wireguard"
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common"
@@ -33,6 +34,7 @@ var (
 )
 
 func RegisterEndpoint(registry *endpoint.Registry) {
+	endpoint.Register[option.PhobosEndpointOptions](registry, C.TypePhobos, NewPhobosEndpoint)
 	endpoint.Register[option.WireGuardEndpointOptions](registry, C.TypeWireGuard, NewEndpoint)
 	endpoint.Register[option.AmneziaWGEndpointOptions](registry, C.TypeAmneziaWG, NewAmneziaWGEndpoint)
 }
@@ -55,6 +57,24 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 
 func NewAmneziaWGEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.AmneziaWGEndpointOptions) (adapter.Endpoint, error) {
 	return newEndpoint(ctx, router, logger, C.TypeAmneziaWG, tag, options.WireGuardCommonOptions, amneziaOptions(options.Amnezia))
+}
+
+func NewPhobosEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.PhobosEndpointOptions) (adapter.Endpoint, error) {
+	obfuscation, err := phobos.Normalize(options.Obfuscation)
+	if err != nil {
+		return nil, err
+	}
+	for _, peer := range options.Peers {
+		for _, value := range peer.Reserved {
+			if value != 0 {
+				return nil, E.New("phobos does not support reserved bytes")
+			}
+		}
+	}
+	if options.MTU == 0 {
+		options.MTU = 1280
+	}
+	return newEndpoint(ctx, router, logger, C.TypePhobos, tag, options.WireGuardCommonOptions, nil, obfuscation)
 }
 
 // oneSidedAmneziaOptions maps the obfuscation a peer never has to know about.
@@ -100,7 +120,11 @@ func amneziaOptions(options *option.WireGuardAmnezia) *wireguard.AmneziaOptions 
 	return amnezia
 }
 
-func newEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, endpointType string, tag string, options option.WireGuardCommonOptions, amnezia *wireguard.AmneziaOptions) (adapter.Endpoint, error) {
+func newEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, endpointType string, tag string, options option.WireGuardCommonOptions, amnezia *wireguard.AmneziaOptions, obfuscations ...*phobos.Options) (adapter.Endpoint, error) {
+	var obfuscation *phobos.Options
+	if len(obfuscations) > 0 {
+		obfuscation = obfuscations[0]
+	}
 	options.UDPFragmentDefault = true
 	ep := &Endpoint{
 		Adapter:        endpoint.NewAdapterWithDialerOptions(endpointType, tag, []string{N.NetworkTCP, N.NetworkUDP, N.NetworkICMP}, options.DialerOptions),
@@ -113,7 +137,7 @@ func newEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	if options.Detour != "" && options.ListenPort != 0 {
 		return nil, E.New("`listen_port` is conflict with `detour`")
 	}
-	configuration, identities, err := sharedDeviceKey(endpointType, options, amnezia)
+	configuration, identities, err := sharedDeviceKey(endpointType, options, amnezia, obfuscation)
 	if err != nil {
 		return nil, err
 	}
@@ -205,6 +229,7 @@ func newEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		}),
 		Workers: options.Workers,
 		Amnezia: amnezia,
+		Phobos:  obfuscation,
 	})
 	if err != nil {
 		return nil, err

@@ -25,6 +25,7 @@ var (
 	addrType               = reflect.TypeFor[badoption.Addr]()
 	prefixType             = reflect.TypeFor[badoption.Prefix]()
 	prefixableType         = reflect.TypeFor[badoption.Prefixable]()
+	regexpType             = reflect.TypeFor[badoption.Regexp]()
 	httpHeaderType         = reflect.TypeFor[badoption.HTTPHeader]()
 	memoryBytesType        = reflect.TypeFor[byteformats.MemoryBytes]()
 	networkBytesCompatType = reflect.TypeFor[byteformats.NetworkBytesCompat]()
@@ -77,7 +78,7 @@ func (g *generator) Describe(valueType reflect.Type) (*Node, error) {
 		return g.Define("Duration", func() (*Node, error) {
 			return DurationNode(), nil
 		})
-	case addrType, prefixType, prefixableType:
+	case addrType, prefixType, prefixableType, regexpType:
 		return StringNode(), nil
 	case httpHeaderType:
 		return g.Define("HTTPHeader", func() (*Node, error) {
@@ -104,6 +105,11 @@ func (g *generator) Describe(valueType reflect.Type) (*Node, error) {
 		return StringNode(), nil
 	}
 	switch valueType.Kind() {
+	case reflect.Interface:
+		if valueType.NumMethod() == 0 {
+			return &Node{}, nil
+		}
+		return nil, E.New("unsupported interface ", valueType.String(), " at ", strings.Join(g.path, "."))
 	case reflect.Struct:
 		if valueType.Name() == "" {
 			node := StrictObject()

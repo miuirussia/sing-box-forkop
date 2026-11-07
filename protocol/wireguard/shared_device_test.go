@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/transport/phobos"
 	"github.com/sagernet/sing-box/transport/wireguard"
 	"github.com/sagernet/sing/common/json/badoption"
 	"github.com/sagernet/sing/service"
@@ -38,19 +39,19 @@ func TestDeviceRegistryIsOnePerBox(t *testing.T) {
 
 func sampleDeviceOptions() (option.WireGuardCommonOptions, *wireguard.AmneziaOptions) {
 	return option.WireGuardCommonOptions{
-			MTU:        1280,
-			Address:    badoption.Listable[netip.Prefix]{netip.MustParsePrefix("10.8.1.5/32")},
-			PrivateKey: "client-key",
-			Peers: []option.WireGuardPeer{{
-				Address:    "203.0.113.1",
-				Port:       51820,
-				PublicKey:  "server-key",
-				AllowedIPs: badoption.Listable[netip.Prefix]{netip.MustParsePrefix("0.0.0.0/0")},
-			}},
-		}, &wireguard.AmneziaOptions{
-			JC: 5,
-			S4: 12,
-		}
+		MTU:        1280,
+		Address:    badoption.Listable[netip.Prefix]{netip.MustParsePrefix("10.8.1.5/32")},
+		PrivateKey: "client-key",
+		Peers: []option.WireGuardPeer{{
+			Address:    "203.0.113.1",
+			Port:       51820,
+			PublicKey:  "server-key",
+			AllowedIPs: badoption.Listable[netip.Prefix]{netip.MustParsePrefix("0.0.0.0/0")},
+		}},
+	}, &wireguard.AmneziaOptions{
+		JC: 5,
+		S4: 12,
+	}
 }
 
 // The key decides which endpoints run on one device, so every setting of the
@@ -97,5 +98,19 @@ func TestSharedDeviceKeyCoversEverySetting(t *testing.T) {
 			require.NoError(t, err)
 			require.NotEqual(t, base, changed)
 		})
+	}
+}
+
+func TestPhobosDeviceIdentity(t *testing.T) {
+	options := option.WireGuardCommonOptions{}
+	base, _, err := sharedDeviceKey("phobos", options, nil, &phobos.Options{Key: "first", Masking: "STUN"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, changed := range []*phobos.Options{{Key: "second", Masking: "STUN"}, {Key: "first", Masking: "MEDIA"}, {Key: "first", Masking: "STUN", ObfuscateBytes: 16}} {
+		key, _, err := sharedDeviceKey("phobos", options, nil, changed)
+		if err != nil || key == base {
+			t.Fatalf("different Phobos settings share a device: %v", err)
+		}
 	}
 }

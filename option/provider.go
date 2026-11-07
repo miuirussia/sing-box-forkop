@@ -3,6 +3,8 @@ package option
 import (
 	"context"
 
+	"github.com/sagernet/sing-box/schema"
+
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badjson"
@@ -20,6 +22,20 @@ type _Provider struct {
 }
 
 type Provider _Provider
+
+func (Provider) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
+	return builder.Define("Provider", func() (*schema.Node, error) {
+		registry := service.FromContext[ProviderOptionsRegistry](builder.Context())
+		if registry == nil {
+			return nil, E.New("missing provider options registry in context")
+		}
+		schemaRegistry, ok := registry.(schemaTypeRegistry)
+		if !ok {
+			return nil, E.New("provider options registry does not support schema generation")
+		}
+		return registryUnion(builder, schemaRegistry, nil, true)
+	})
+}
 
 func (h *Provider) MarshalJSONContext(ctx context.Context) ([]byte, error) {
 	return badjson.MarshallObjectsContext(ctx, (*_Provider)(h), h.Options)

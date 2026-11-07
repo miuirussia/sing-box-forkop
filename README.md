@@ -2,6 +2,7 @@
 
 ## Что нового
 
+- **Phobos** — клиент WireGuard с обфускацией STUN, MEDIA, NONE и AUTO
 - **AmneziaWG 2.0 и 3.x** — обфускация WireGuard
 - **Cloudflare WARP** — WARP через WireGuard с обфускацией AmneziaWG
 - **TrustTunnel** — протокол AdGuard, клиент и сервер
@@ -28,7 +29,7 @@
 | --- | --- | :---: | :---: | :---: |
 | `with_quic` | Hysteria, Hysteria2, TUIC, QUIC, DNS over QUIC и HTTP/3, XHTTP поверх HTTP/3 | ✓ | ✓ | ✓ |
 | `with_gvisor` | сетевой стек в памяти для туннелей | | ✓ | ✓ |
-| `with_wireguard` | WireGuard, AmneziaWG, WARP | | ✓ | ✓ |
+| `with_wireguard` | WireGuard, AmneziaWG, Phobos, WARP | | ✓ | ✓ |
 | `with_openvpn` | OpenVPN, клиент и сервер | | ✓ | ✓ |
 | `with_trusttunnel` | TrustTunnel, клиент и сервер | | ✓ | ✓ |
 | `with_vmess` | VMess | | ✓ | ✓ |
@@ -76,3 +77,45 @@
 ## Лицензия
 
 Ядро распространяется по лицензии [GPL-3.0-or-later](LICENSE).
+
+## Phobos
+
+Клиентский endpoint `phobos` подключается к WireGuard-пресетам Phobos. Нужна сборка с `with_wireguard` и `with_gvisor`. Обфускатор встроен; отдельный процесс не требуется.
+
+```json
+{
+  "endpoints": [{
+    "type": "phobos",
+    "tag": "phobos-vpn",
+    "address": ["10.8.0.2/32"],
+    "private_key": "<WireGuard private key>",
+    "peers": [{
+      "address": "vpn.example.com",
+      "port": 51822,
+      "public_key": "<WireGuard server public key>",
+      "allowed_ips": ["0.0.0.0/0", "::/0"],
+      "persistent_keepalive_interval": 25
+    }],
+    "obfuscation": {
+      "key": "<preset XOR key>",
+      "masking": "STUN"
+    }
+  }]
+}
+```
+
+Из профиля Phobos перенесите `PrivateKey`, `Address`, `PublicKey`, `PresharedKey` (если есть), `AllowedIPs` и `PersistentKeepalive` в соответствующие поля WireGuard. Адрес и порт peer берутся из `target` секции `[instance]`: это публичный адрес обфускатора, а не локальный `Endpoint` WireGuard. `source-lport` не нужен. DNS и правила направления трафика задаются обычной конфигурацией sing-box.
+
+В `obfuscation` ключ `key` обязателен (1–255 байт без NUL). `masking` — `STUN` (по умолчанию), `MEDIA`, `NONE` или `AUTO`; значение должно соответствовать пресету сервера. Клиент AUTO начинает без внешней маскировки; сервер AUTO распознаёт STUN, но не MEDIA.
+
+`max_dummy` соответствует `max-dummy` (0–1024, по умолчанию 4). `obfuscate_bytes` соответствует `obfuscate-bytes`: число первых обрабатываемых байт; 0 означает весь пакет. По умолчанию это 16 для MEDIA и 0 для остальных режимов. Явный 0 сохраняется; на сервере также должна быть включена полная обработка. В зафиксированной версии upstream MEDIA принудительно заменяет 0 на 16.
+
+Поля MEDIA: `media_pt` (0–127; 0 выбирает пресет), `media_ssrc` (uint32; 0 выбирает случайный SSRC), `media_clock` (0–1000 кадров/с; 0 выбирает пресет). Они соответствуют `media-pt`, `media-ssrc`, `media-clock`. Настройки обфускации общие для всех peers endpoint. `reserved` с ненулевыми байтами не поддерживается. MTU по умолчанию — 1280; его можно задать явно.
+
+Совместимость основана на [Phobos commit 22aedef](https://github.com/Ground-Zerro/Phobos/tree/22aedefda053062dc58c036072d2da6e216d5a34/src/phobos-obfuscator). SOCKS5 через TCP, серверная сторона и автоматический импорт профилей не входят в эту поддержку.
+
+Для проверки с исходной реализацией соберите `transport/phobos/testdata/reference.c`, передав компилятору `-I` с каталогом обфускатора этой версии. Задайте `PHOBOS_REFERENCE` путём к результату, а `PHOBOS_OBFUSCATOR` — путём к собранному upstream `wg-obfuscator`, затем выполните:
+
+```sh
+go test -race -ldflags=-checklinkname=0 -tags with_wireguard,with_gvisor,badlinkname,with_utls ./transport/phobos ./transport/wireguard ./protocol/wireguard ./include
+```

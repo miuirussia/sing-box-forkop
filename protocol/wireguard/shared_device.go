@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/transport/phobos"
 	"github.com/sagernet/sing-box/transport/wireguard"
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/json"
@@ -40,6 +41,7 @@ type deviceRegistry struct {
 }
 
 type deviceConfiguration struct {
+	Phobos  *phobos.Options               `json:"phobos,omitempty"`
 	Type    string                        `json:"type"`
 	Options option.WireGuardCommonOptions `json:"options"`
 	Amnezia *wireguard.AmneziaOptions     `json:"amnezia,omitempty"`
@@ -61,8 +63,12 @@ func deviceRegistryFromContext(ctx context.Context) *deviceRegistry {
 	return registry
 }
 
-func sharedDeviceKey(endpointType string, options option.WireGuardCommonOptions, amnezia *wireguard.AmneziaOptions) (string, []string, error) {
-	content, err := json.Marshal(deviceConfiguration{Type: endpointType, Options: options, Amnezia: amnezia})
+func sharedDeviceKey(endpointType string, options option.WireGuardCommonOptions, amnezia *wireguard.AmneziaOptions, obfuscations ...*phobos.Options) (string, []string, error) {
+	var obfuscation *phobos.Options
+	if len(obfuscations) > 0 {
+		obfuscation = obfuscations[0]
+	}
+	content, err := json.Marshal(deviceConfiguration{Type: endpointType, Options: options, Amnezia: amnezia, Phobos: obfuscation})
 	if err != nil {
 		return "", nil, err
 	}

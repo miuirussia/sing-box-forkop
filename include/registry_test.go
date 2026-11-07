@@ -24,7 +24,7 @@ func TestEveryTypeIsRegisteredWhateverTheTags(t *testing.T) {
 		C.TypeTrustTunnel, C.TypeParser, C.TypeHysteria, C.TypeTUIC, C.TypeHysteria2,
 	})
 	require.Subset(t, EndpointRegistry().OptionTypes(), []string{
-		C.TypeWireGuard, C.TypeAmneziaWG, C.TypeWARP, C.TypeOpenConnect, C.TypeOpenVPNClient,
+		C.TypeWireGuard, C.TypeAmneziaWG, C.TypePhobos, C.TypeWARP, C.TypeOpenConnect, C.TypeOpenVPNClient,
 		C.TypeOpenVPNServer, C.TypeTailscale,
 	})
 	require.Subset(t, DNSTransportRegistry().OptionTypes(), []string{

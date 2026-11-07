@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"slices"
 	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -52,6 +53,17 @@ func (r *Registry) CreateOptions(providerType string) (any, bool) {
 		return nil, false
 	}
 	return optionsConstructor(), true
+}
+
+func (r *Registry) OptionTypes() []string {
+	r.access.Lock()
+	defer r.access.Unlock()
+	types := make([]string, 0, len(r.optionsType))
+	for providerType := range r.optionsType {
+		types = append(types, providerType)
+	}
+	slices.Sort(types)
+	return types
 }
 
 func (r *Registry) CreateProvider(ctx context.Context, router adapter.Router, logFactory log.Factory, tag string, providerType string, options any) (adapter.Provider, error) {

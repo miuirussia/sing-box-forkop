@@ -15,6 +15,7 @@ import (
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/service/powerreport"
+	"github.com/sagernet/sing-box/transport/phobos"
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -227,6 +228,9 @@ func (e *Endpoint) Start(postStart bool) error {
 				bind.SetReservedForEndpoint(peer.endpoint, peer.reserved)
 			}
 		}
+	}
+	if e.options.Phobos != nil {
+		bind = phobos.NewBind(bind, *e.options.Phobos)
 	}
 	err := e.tunDevice.Start()
 	if err != nil {

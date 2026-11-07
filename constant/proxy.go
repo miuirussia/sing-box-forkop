@@ -17,6 +17,7 @@ const (
 	TypeTrojan             = "trojan"
 	TypeTrustTunnel        = "trusttunnel"
 	TypeNaive              = "naive"
+	TypePhobos             = "phobos"
 	TypeAmneziaWG          = "amneziawg"
 	TypeWireGuard          = "wireguard"
 	TypeWARP               = "warp"
@@ -92,6 +93,8 @@ func ProxyDisplayName(proxyType string) string {
 		return "Naive"
 	case TypeWireGuard:
 		return "WireGuard"
+	case TypePhobos:
+		return "Phobos"
 	case TypeAmneziaWG:
 		return "AmneziaWG"
 	case TypeWARP:
