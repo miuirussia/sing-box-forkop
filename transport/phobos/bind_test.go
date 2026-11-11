@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/wireguard-go/conn"
 )
 
@@ -46,6 +47,31 @@ type testEndpoint struct{ conn.Endpoint }
 
 func (testEndpoint) DstToString() string { return "127.0.0.1:1234" }
 func (testEndpoint) DstIP() netip.Addr   { return netip.MustParseAddr("127.0.0.1") }
+
+func TestBindUpstream(t *testing.T) {
+	standard := conn.NewStdNetBind(nil)
+	for _, test := range []struct {
+		name string
+		bind conn.Bind
+		want conn.Bind
+	}{
+		{"standard", standard, standard},
+		{"phobos standard", NewBind(standard, Options{}), standard},
+		{"nested phobos", NewBind(NewBind(standard, Options{}), Options{}), standard},
+		{"phobos detour", NewBind(new(testBind), Options{}), nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := common.Cast[*conn.StdNetBind](test.bind)
+			if test.want == nil {
+				if ok {
+					t.Fatal("non-standard bind reported as a standard bind")
+				}
+			} else if !ok || got != test.want {
+				t.Fatal("underlying standard bind is not discoverable")
+			}
+		})
+	}
+}
 
 func TestBindFramingAndLifecycle(t *testing.T) {
 	for _, mode := range []string{"STUN", "NONE", "AUTO", "MEDIA"} {

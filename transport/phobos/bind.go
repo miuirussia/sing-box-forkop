@@ -36,6 +36,8 @@ type Bind struct {
 
 func NewBind(inner conn.Bind, options Options) *Bind { return &Bind{Bind: inner, options: options} }
 
+func (b *Bind) Upstream() any { return b.Bind }
+
 func (b *Bind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	fns, actual, err := b.Bind.Open(port)
 	if err != nil {

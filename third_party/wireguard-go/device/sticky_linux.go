@@ -18,6 +18,7 @@ import (
 	"sync"
 	"unsafe"
 
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/wireguard-go/conn"
 	"github.com/sagernet/wireguard-go/rwcancel"
 	"golang.org/x/sys/unix"
@@ -27,7 +28,7 @@ func (device *Device) startRouteListener(bind conn.Bind) (*rwcancel.RWCancel, er
 	if !conn.StdNetSupportsStickySockets {
 		return nil, nil
 	}
-	if _, ok := bind.(*conn.StdNetBind); !ok {
+	if _, ok := common.Cast[*conn.StdNetBind](bind); !ok {
 		return nil, nil
 	}
 
