@@ -15,6 +15,7 @@
 - **Парсер ссылок** — сервер задаётся одной ссылкой
 - **DNS Fallback** — несколько DNS-серверов, переключение при сбоях
 - **Текстовые rule set** — домены и подсети по одному в строке
+- **DAT → SRS** — потоковое чтение geosite/geoip V2Ray, индекс тегов и экспорт выбранного тега без промежуточного JSON
 - **Экспорт подсетей** — адреса наборов правил через Clash API для nftables
 - **Адрес выхода** — IP и страна выхода подключения через Clash API
 - **Tailscale в Clash API** — состояние, выходной узел и пинг устройств сети
@@ -22,6 +23,20 @@
 - **Улучшения и исправления**
 
 ## Сборки
+
+Для баз V2Ray/Xray доступны команды:
+
+```sh
+sing-box geodata list --kind geosite --file geosite.dat --output index.json
+sing-box geodata tags --index index.json --search youtube --offset 0
+sing-box geodata export --kind geosite --file geosite.dat --index index.json --tag youtube --output youtube.srs
+sing-box geodata export --kind geosite --file geosite.dat --index index.json --tag 'google@!cn' --output google.srs
+sing-box geodata export --kind geoip --file geoip.dat --tag ru --output ru.srs
+```
+
+`list` читает базу с буфером 32 КиБ; `tags` возвращает до 200 результатов. Индекс проверяется по размеру и времени изменения исходного файла. Экспорт компилирует один тег непосредственно в SRS, сохраняя типы доменов и IPv4/IPv6 CIDR, включая `/0`. GeoIP `inverse_match` отклоняется, поскольку Forkop экспортирует положительные подсети в nftables. Результаты публикуются атомарно, существующий SRS сохраняется при ошибке.
+
+`sing-box geodata fetch --url URL --output source.dat` скачивает базу напрямую потоком, с лимитом 128 МиБ и тайм-аутом 10 минут. Для загрузки через выбранный outbound работает локальный аутентифицированный `POST /geodata/download` Clash API; ответ предназначен для менеджера Forkop и содержит маркер завершения после данных. Старые команды `geosite` и `geoip` по-прежнему обслуживают формат `.db`.
 
 Сборка задаётся тегами Go. `with_clash_api` и `with_utls` есть в любой сборке, остальные необязательны.
 

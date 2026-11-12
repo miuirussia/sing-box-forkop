@@ -67,6 +67,7 @@ type Server struct {
 	externalUIDownloadURL    string
 	externalUIDownloadDetour string
 	externalUIAccess         sync.Mutex
+	geodataAccess            sync.Mutex
 }
 
 func NewServer(ctx context.Context, logFactory log.ObservableFactory, options option.ClashAPIOptions) (adapter.LifecycleService, error) {
@@ -139,6 +140,7 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		r.Mount("/cache", cacheRouter(ctx))
 		r.Mount("/dns", dnsRouter(s.dnsRouter))
 		r.Mount("/tailscale", tailscaleRouter(s.endpoint))
+		r.Post("/geodata/download", s.downloadGeodata)
 
 		s.setupMetaAPI(r)
 	})

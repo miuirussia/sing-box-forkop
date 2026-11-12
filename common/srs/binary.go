@@ -350,7 +350,14 @@ func writeDefaultRule(writer varbin.Writer, rule option.DefaultHeadlessRule, gen
 			return E.Cause(err, "source_ip_cidr")
 		}
 	}
-	if len(rule.IPCIDR) > 0 {
+	if rule.IPSet != nil {
+		if err = writer.WriteByte(ruleItemIPCIDR); err != nil {
+			return err
+		}
+		if err = writeIPSet(writer, rule.IPSet); err != nil {
+			return err
+		}
+	} else if len(rule.IPCIDR) > 0 {
 		err = writeRuleItemCIDR(writer, ruleItemIPCIDR, rule.IPCIDR)
 		if err != nil {
 			return E.Cause(err, "ipcidr")
