@@ -12,8 +12,11 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/httpclient"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/logger"
+	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/service"
 )
 
@@ -38,6 +41,44 @@ type geodataResponseRecorder struct {
 }
 
 func (*geodataResponseRecorder) SetWriteDeadline(time.Time) error { return nil }
+
+type geodataOutbound struct {
+	adapter.Outbound
+	destination string
+}
+
+func (o *geodataOutbound) Tag() string { return "vpn" }
+
+func (o *geodataOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	o.destination = destination.String()
+	return (&net.Dialer{}).DialContext(ctx, network, destination.String())
+}
+
+func TestDownloadGeodataThroughOutbound(t *testing.T) {
+	t.Parallel()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "DAT content")
+	}))
+	defer upstream.Close()
+	outbound := &geodataOutbound{}
+	ctx := service.ContextWith[adapter.OutboundManager](t.Context(), &linkAPIOutboundManager{
+		outbounds: []adapter.Outbound{outbound},
+	})
+	manager := httpclient.NewManager(ctx, log.NewNOPFactory().NewLogger("test"), nil, "")
+	server := &Server{ctx: service.ContextWith[adapter.HTTPClientManager](ctx, manager)}
+	request := httptest.NewRequest(http.MethodPost, "/geodata/download", strings.NewReader(
+		`{"url":"`+upstream.URL+`/geosite.dat","detour":"vpn"}`,
+	))
+	request.RemoteAddr = "127.0.0.1:12345"
+	recorder := &geodataResponseRecorder{httptest.NewRecorder()}
+	server.downloadGeodata(recorder, request)
+	if recorder.Code != http.StatusOK || recorder.Body.String() != "DAT content\nFORKOP-GEODATA-DONE\n" {
+		t.Fatalf("download failed: %d %s", recorder.Code, recorder.Body)
+	}
+	if outbound.destination != strings.TrimPrefix(upstream.URL, "http://") {
+		t.Fatalf("download did not use the selected outbound: %q", outbound.destination)
+	}
+}
 
 func TestDownloadGeodata(t *testing.T) {
 	t.Parallel()

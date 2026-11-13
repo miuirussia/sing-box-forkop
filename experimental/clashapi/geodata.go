@@ -59,7 +59,9 @@ func (s *Server) downloadGeodata(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "HTTP client is unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	transport, err := manager.ResolveTransport(ctx, log.StdLogger(), option.HTTPClientOptions{
+	// Transport construction needs the core's service registry; the outgoing
+	// request below still follows the caller's cancellation and deadline.
+	transport, err := manager.ResolveTransport(s.ctx, log.StdLogger(), option.HTTPClientOptions{
 		DialerOptions: option.DialerOptions{Detour: request.Detour}, DisableEmptyDirectCheck: true,
 	})
 	if err != nil {
