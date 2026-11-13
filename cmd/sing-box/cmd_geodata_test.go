@@ -2,10 +2,65 @@ package main
 
 import (
 	"bytes"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestGeodataFetchAtomic(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/truncated" {
+			w.Header().Set("Content-Length", "100")
+		}
+		if _, err := w.Write([]byte("valid-dat")); err != nil {
+			t.Error(err)
+		}
+	}))
+	defer server.Close()
+	tests := []struct {
+		name string
+		mark string
+		path string
+		ok   bool
+	}{
+		{name: "unmarked", mark: "0", path: "/ok", ok: true},
+		{name: "truncated", mark: "0", path: "/truncated"},
+		{name: "negative mark", mark: "-1", path: "/ok"},
+		{name: "overflow mark", mark: "0x100000000", path: "/ok"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			output := filepath.Join(t.TempDir(), "source.dat")
+			if err := os.WriteFile(output, []byte("previous"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			command := newGeodataCommand()
+			command.SetArgs([]string{
+				"fetch", "--url", server.URL + test.path,
+				"--output", output, "--routing-mark", test.mark,
+			})
+			command.SetErr(&bytes.Buffer{})
+			command.SetOut(&bytes.Buffer{})
+			if err := command.Execute(); (err == nil) != test.ok {
+				t.Fatalf("fetch error = %v, want success %v", err, test.ok)
+			}
+			data, err := os.ReadFile(output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "previous"
+			if test.ok {
+				want = "valid-dat"
+			}
+			if string(data) != want {
+				t.Fatalf("download = %q, want %q", data, want)
+			}
+		})
+	}
+}
 
 func TestGeodataExportAtomic(t *testing.T) {
 	t.Parallel()

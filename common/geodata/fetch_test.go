@@ -32,7 +32,12 @@ func TestFetch(t *testing.T) {
 			}))
 			defer server.Close()
 			var output bytes.Buffer
-			err := Fetch(context.Background(), server.URL, &output)
+			err := Fetch(
+				context.Background(),
+				server.URL,
+				0,
+				&output,
+			)
 			if (err == nil) != test.valid {
 				t.Fatalf("Fetch error = %v", err)
 			}
@@ -41,7 +46,12 @@ func TestFetch(t *testing.T) {
 			}
 		})
 	}
-	if err := Fetch(context.Background(), "file:///etc/passwd", &bytes.Buffer{}); err == nil {
+	if err := Fetch(
+		context.Background(),
+		"file:///etc/passwd",
+		0,
+		&bytes.Buffer{},
+	); err == nil {
 		t.Fatal("accepted file URL")
 	}
 }

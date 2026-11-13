@@ -76,16 +76,25 @@ func newGeodataCommand() *cobra.Command {
 	_ = export.MarkFlagRequired("output")
 	command.AddCommand(list, export)
 	var address, destination string
+	var routingMark uint32
 	fetch := &cobra.Command{Use: "fetch", Short: "Download a DAT directly with bounded memory and size", Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Minute)
 			defer cancel()
-			return writeGeodataFile(destination, func(w io.Writer) error { return geodata.Fetch(ctx, address, w) })
+			return writeGeodataFile(destination, func(w io.Writer) error {
+				return geodata.Fetch(
+					ctx,
+					address,
+					routingMark,
+					w,
+				)
+			})
 		},
 	}
 	// Fetch does not read a database, unlike list/export.
 	fetch.Flags().StringVar(&address, "url", "", "HTTP(S) URL")
 	fetch.Flags().StringVar(&destination, "output", "", "Destination file")
+	fetch.Flags().Uint32Var(&routingMark, "routing-mark", 0, "Routing mark for download and DNS sockets")
 	_ = fetch.MarkFlagRequired("url")
 	_ = fetch.MarkFlagRequired("output")
 	command.AddCommand(fetch)

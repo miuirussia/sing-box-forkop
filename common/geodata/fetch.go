@@ -4,13 +4,16 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+
+	"github.com/sagernet/sing/common/control"
 )
 
 // Fetch is for the initial direct download, before the routing core is up.
 // Through-outbound downloads use the running core's authenticated controller.
-func Fetch(ctx context.Context, address string, output io.Writer) error {
+func Fetch(ctx context.Context, address string, routingMark uint32, output io.Writer) error {
 	u, err := url.Parse(address)
 	if err != nil || u.Host == "" || u.User != nil || (u.Scheme != "http" && u.Scheme != "https") {
 		return fmt.Errorf("expected HTTP(S) URL")
@@ -21,6 +24,12 @@ func Fetch(ctx context.Context, address string, output io.Writer) error {
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
+	if routingMark != 0 {
+		dialer := &net.Dialer{Control: control.RoutingMark(routingMark)}
+		// Bootstrap DNS must bypass the router's transparent DNS capture too.
+		dialer.Resolver = &net.Resolver{PreferGo: true, Dial: dialer.DialContext}
+		transport.DialContext = dialer.DialContext
+	}
 	defer transport.CloseIdleConnections()
 	response, err := (&http.Client{Transport: transport}).Do(request)
 	if err != nil {
