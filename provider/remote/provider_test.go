@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -110,12 +111,19 @@ func TestProviderRequestUserAgentHeaderOverridesTheOption(t *testing.T) {
 		userAgent  string
 		configured badoption.HTTPHeader
 		expected   string
+		encrypted  bool
 	}{
-		{"default", "", nil, "sing-box " + C.Version},
-		{"option", "Clash", nil, "Clash"},
-		{"header", "", badoption.HTTPHeader{"User-Agent": {"Happ"}}, "Happ"},
-		{"lower case header", "Clash", badoption.HTTPHeader{"user-agent": {"Happ"}}, "Happ"},
-		{"removed", "", badoption.HTTPHeader{"User-Agent": {""}}, ""},
+		{name: "default", expected: "sing-box " + C.Version},
+		{name: "option", userAgent: "Clash", expected: "Clash"},
+		{name: "header", configured: badoption.HTTPHeader{"User-Agent": {"Happ"}}, expected: "Happ"},
+		{name: "lower case header", userAgent: "Clash", configured: badoption.HTTPHeader{"user-agent": {"Happ"}}, expected: "Happ"},
+		{name: "removed", configured: badoption.HTTPHeader{"User-Agent": {""}}},
+		{
+			name:       "encrypted provider keeps the header",
+			configured: badoption.HTTPHeader{"User-Agent": {"custom"}},
+			expected:   "custom",
+			encrypted:  true,
+		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			received := make(chan string, 1)
@@ -124,13 +132,17 @@ func TestProviderRequestUserAgentHeaderOverridesTheOption(t *testing.T) {
 				w.WriteHeader(http.StatusInternalServerError)
 			}))
 			defer server.Close()
+			source := server.URL
+			if testCase.encrypted {
+				source = incyProviderTestLink(t, source)
+			}
 
 			provider, err := NewProviderRemote(
 				service.ContextWith[adapter.OutboundManager](context.Background(), nil),
 				nil,
 				log.NewNOPFactory(),
 				"provider",
-				option.ProviderRemoteOptions{URL: server.URL, UserAgent: testCase.userAgent, Headers: testCase.configured},
+				option.ProviderRemoteOptions{URL: source, UserAgent: testCase.userAgent, Headers: testCase.configured},
 			)
 			if err != nil {
 				t.Fatal(err)
@@ -146,6 +158,112 @@ func TestProviderRequestUserAgentHeaderOverridesTheOption(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestProviderRedirectReferer(t *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		encrypted   bool
+		crossOrigin bool
+		referer     string
+	}{
+		{name: "encrypted across origins", encrypted: true, crossOrigin: true},
+		{name: "encrypted within one origin", encrypted: true},
+		{name: "encrypted with configured referer", encrypted: true, crossOrigin: true, referer: "https://example.com/"},
+		{name: "plain across origins", crossOrigin: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			received := make(chan string, 1)
+			serveResult := func(w http.ResponseWriter, r *http.Request) {
+				received <- r.Referer()
+				w.WriteHeader(http.StatusNotModified)
+			}
+			location := "/result"
+			if testCase.crossOrigin {
+				destination := httptest.NewServer(http.HandlerFunc(serveResult))
+				defer destination.Close()
+				location = destination.URL + location
+			}
+			source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/result" {
+					serveResult(w, r)
+					return
+				}
+				http.Redirect(w, r, location, http.StatusFound)
+			}))
+			defer source.Close()
+			remote := &ProviderRemote{
+				ctx:          t.Context(),
+				logger:       log.NewNOPFactory().NewLogger("test"),
+				dialer:       systemTestDialer{},
+				url:          source.URL + "/subscription?token=example",
+				encryptedURL: testCase.encrypted,
+				headers:      make(http.Header),
+			}
+			want := testCase.referer
+			if testCase.referer != "" {
+				remote.headers.Set("Referer", testCase.referer)
+			} else if !testCase.encrypted || !testCase.crossOrigin {
+				want = remote.url
+			}
+			if err := remote.Update(); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case got := <-received:
+				if got != want {
+					t.Fatalf("Referer = %q, want %q", got, want)
+				}
+			default:
+				t.Fatal("redirect destination was not reached")
+			}
+		})
+	}
+}
+
+func TestEncryptedProviderKeepsRedirectLimit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/subscription", http.StatusFound)
+	}))
+	defer server.Close()
+	remote := &ProviderRemote{
+		ctx:          t.Context(),
+		logger:       log.NewNOPFactory().NewLogger("test"),
+		dialer:       systemTestDialer{},
+		url:          server.URL + "/subscription",
+		encryptedURL: true,
+	}
+	if err := remote.Update(); !errors.Is(err, errProviderRedirectLimit) {
+		t.Fatalf("redirect loop returned %v", err)
+	}
+}
+
+func TestEncryptedProviderHidesRequestFailureDetails(t *testing.T) {
+	const privateDetail = "synthetic subscription token"
+	cause := errors.New("transport error containing a " + privateDetail)
+	remote := &ProviderRemote{
+		ctx:          t.Context(),
+		logger:       log.NewNOPFactory().NewLogger("test"),
+		dialer:       failingProviderDialer{err: cause},
+		url:          "https://example.com/subscription",
+		encryptedURL: true,
+	}
+	err := remote.Update()
+	if err == nil {
+		t.Fatal("failed update was reported as a success")
+	}
+	if strings.Contains(err.Error(), privateDetail) || errors.Is(err, cause) {
+		t.Fatal("update error exposed the private transport error")
+	}
+}
+
+type failingProviderDialer struct {
+	systemTestDialer
+	err error
+}
+
+func (d failingProviderDialer) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
+	return nil, d.err
 }
 
 type errorRecordingLogger struct {

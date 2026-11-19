@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -38,6 +39,8 @@ var _ adapter.Provider = (*ProviderRemote)(nil)
 
 const providerFetchTimeout = 4 * C.TCPTimeout
 
+var errProviderRedirectLimit = errors.New("stopped after 10 redirects")
+
 type ProviderRemote struct {
 	provider.Adapter
 	ctx              context.Context
@@ -58,6 +61,7 @@ type ProviderRemote struct {
 	updateAccess     sync.Mutex
 
 	url            string
+	encryptedURL   bool
 	userAgent      string
 	downloadDetour string
 	updateInterval time.Duration
@@ -69,6 +73,10 @@ type ProviderRemote struct {
 func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory log.Factory, tag string, options option.ProviderRemoteOptions) (adapter.Provider, error) {
 	if options.URL == "" {
 		return nil, E.New("provider URL is required")
+	}
+	resolvedURL, encryptedURL, err := resolveProviderURL(options.URL, happKeysDir)
+	if err != nil {
+		return nil, err
 	}
 	// A missing update_interval disables scheduled updates: the provider is fetched until it first has
 	// content, and when updated through the Clash API.
@@ -98,7 +106,8 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 		outbound: outbound,
 		provider: service.FromContext[adapter.ProviderManager](ctx),
 
-		url:            options.URL,
+		url:            resolvedURL,
+		encryptedURL:   encryptedURL,
 		userAgent:      userAgent,
 		downloadDetour: options.DownloadDetour,
 		headers:        options.Headers.Build(),
@@ -270,7 +279,11 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, providerFetchTimeout)
 	defer cancel()
-	s.logger.Debug("updating outbound provider ", s.Tag(), " from URL: ", s.url)
+	if s.encryptedURL {
+		s.logger.Debug("updating outbound provider ", s.Tag())
+	} else {
+		s.logger.Debug("updating outbound provider ", s.Tag(), " from URL: ", s.url)
+	}
 	transport := &http.Transport{
 		ForceAttemptHTTP2:   true,
 		TLSHandshakeTimeout: C.TCPTimeout,
@@ -283,6 +296,19 @@ func (s *ProviderRemote) fetch(ctx context.Context) error {
 		},
 	}
 	client := &http.Client{Transport: transport}
+	if s.encryptedURL {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errProviderRedirectLimit
+			}
+			previous := via[len(via)-1].URL
+			sameOrigin := req.URL.Scheme == previous.Scheme && req.URL.Host == previous.Host
+			if !sameOrigin && via[0].Header.Get("Referer") == "" {
+				req.Header.Del("Referer")
+			}
+			return nil
+		}
+	}
 	defer transport.CloseIdleConnections()
 	result, err := s.fetchProvider(ctx, client)
 	if err != nil {
@@ -321,7 +347,17 @@ func (s *ProviderRemote) fetchProvider(ctx context.Context, client *http.Client)
 	}
 	response, err := client.Do(req.WithContext(ctx))
 	if err != nil {
-		return result, err
+		if !s.encryptedURL {
+			return result, err
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return result, ctxErr
+		}
+		if errors.Is(err, errProviderRedirectLimit) {
+			return result, errProviderRedirectLimit
+		}
+		// Both the URL error and its underlying cause can include the subscription URL.
+		return result, E.New("request for encrypted subscription failed")
 	}
 	defer response.Body.Close()
 	result.metadataValues = metadataHeaderValues(response.Header)
