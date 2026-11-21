@@ -88,6 +88,7 @@ func URLTest(ctx context.Context, link string, detour N.Dialer) (uint16, error) 
 }
 
 func URLTestWithExpectedStatus(ctx context.Context, link string, detour N.Dialer, expectedStatus ExpectedStatus) (uint16, error) {
+	ctx = context.WithValue(ctx, contextKeyOutbound{}, detour)
 	multiplexOutbound, isMultiplexOutbound := common.Cast[adapter.OutboundWithMultiplex](detour)
 	if isMultiplexOutbound && multiplexOutbound.MultiplexEnabled() {
 		warmContext := adapter.ContextWithKeepSession(ctx)

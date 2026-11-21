@@ -3,12 +3,16 @@ package group
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -45,6 +49,298 @@ func TestURLTestGroupHistoryIsIsolated(t *testing.T) {
 	}
 	if sharedHistory.LoadURLTestHistory("node") != nil {
 		t.Fatal("dashboard still reports a delay for an outbound that just failed")
+	}
+}
+
+type initialURLTestOutbound struct {
+	*fallbackHealthTestOutbound
+}
+
+func (o *initialURLTestOutbound) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
+	return net.ListenPacket("udp", "127.0.0.1:0")
+}
+
+// A tunnel must not dial the first subscription member while its probe is
+// stalled. It can use a tested member without waiting for that stalled probe.
+func TestURLTestFirstConnectionWaitsForAWorkingMember(t *testing.T) {
+	for _, network := range []string{N.NetworkTCP, N.NetworkUDP, "packet", "probe"} {
+		t.Run(network, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			blocked := &fallbackBlockingOutbound{
+				Adapter: outboundAdapter.NewAdapter("test", "blocked", []string{N.NetworkTCP, N.NetworkUDP}, nil),
+				started: make(chan struct{}),
+			}
+			working := &initialURLTestOutbound{newFallbackHealthTestOutbound("working", true)}
+			manager := &testOutboundManager{outbounds: map[string]adapter.Outbound{blocked.Tag(): blocked, working.Tag(): working}}
+			logger := log.NewNOPFactory().NewLogger("test")
+			group, err := NewURLTestGroup(ctx, manager, logger, []adapter.Outbound{blocked, working}, "http://health.test/generate_204", nil, 0, 0, 0, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer group.Close()
+			urlTest := &URLTest{group: group}
+			dialCtx, cancelDial := context.WithTimeout(ctx, time.Second)
+			defer cancelDial()
+			if network == "probe" {
+				if _, err := urltest.URLTest(dialCtx, "http://health.test/", urlTest); err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if network == "packet" {
+				conn, err := urlTest.ListenPacket(dialCtx, M.Socksaddr{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				conn.Close()
+			} else {
+				conn, err := urlTest.DialContext(dialCtx, network, M.Socksaddr{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				conn.Close()
+			}
+		})
+	}
+}
+
+func TestURLTestInitialSelectionCanBeCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	blocked := &fallbackBlockingOutbound{
+		Adapter: outboundAdapter.NewAdapter("test", "blocked", []string{N.NetworkTCP}, nil),
+		started: make(chan struct{}),
+	}
+	manager := &testOutboundManager{outbounds: map[string]adapter.Outbound{blocked.Tag(): blocked}}
+	group, err := NewURLTestGroup(ctx, manager, log.NewNOPFactory().NewLogger("test"), []adapter.Outbound{blocked}, "http://health.test/generate_204", nil, 0, 0, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer group.Close()
+	dialCtx, cancelDial := context.WithTimeout(ctx, 30*time.Millisecond)
+	defer cancelDial()
+	_, err = (&URLTest{group: group}).DialContext(dialCtx, N.NetworkTCP, M.Socksaddr{})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected cancellation, got %v", err)
+	}
+}
+
+func TestURLTestInitialSelectionWakesEveryWaitingConnection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	blocked := &fallbackBlockingOutbound{
+		Adapter: outboundAdapter.NewAdapter("test", "blocked", []string{N.NetworkTCP}, nil),
+		started: make(chan struct{}),
+	}
+	working := newFallbackHealthTestOutbound("working", true)
+	manager := &testOutboundManager{outbounds: map[string]adapter.Outbound{blocked.Tag(): blocked, working.Tag(): working}}
+	group, err := NewURLTestGroup(ctx, manager, log.NewNOPFactory().NewLogger("test"), []adapter.Outbound{blocked, working}, "http://health.test/generate_204", nil, 0, 0, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer group.Close()
+	urlTest := &URLTest{group: group}
+	results := make(chan error, 12)
+	dialCtx, cancelDial := context.WithTimeout(ctx, time.Second)
+	defer cancelDial()
+	for range 12 {
+		go func() {
+			conn, err := urlTest.DialContext(dialCtx, N.NetworkTCP, M.Socksaddr{})
+			if conn != nil {
+				conn.Close()
+			}
+			results <- err
+		}()
+	}
+	for range 12 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestURLTestInitialSelectionRejectsFailedMembers(t *testing.T) {
+	node := newFallbackHealthTestOutbound("failed", false)
+	manager := &testOutboundManager{outbounds: map[string]adapter.Outbound{node.Tag(): node}}
+	group, err := NewURLTestGroup(context.Background(), manager, log.NewNOPFactory().NewLogger("test"), []adapter.Outbound{node}, "http://health.test/generate_204", nil, 0, 0, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer group.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err = (&URLTest{group: group}).DialContext(ctx, N.NetworkTCP, M.Socksaddr{})
+	if err == nil || !strings.Contains(err.Error(), "no outbound passed the initial URL test") {
+		t.Fatalf("expected failed probes, got %v", err)
+	}
+	if node.dialCount != 1 {
+		t.Fatalf("dialed a member after its probe failed: %d attempts", node.dialCount)
+	}
+}
+
+func TestURLTestInitialSelectionRetriesAfterFailure(t *testing.T) {
+	node := newFallbackHealthTestOutbound("node", false)
+	manager := &testOutboundManager{outbounds: map[string]adapter.Outbound{node.Tag(): node}}
+	group, err := NewURLTestGroup(t.Context(), manager, log.NewNOPFactory().NewLogger("test"), []adapter.Outbound{node}, "http://health.test/", nil, 0, 0, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	urlTest := &URLTest{group: group}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if conn, err := urlTest.DialContext(ctx, N.NetworkTCP, M.Socksaddr{}); err == nil {
+		conn.Close()
+		t.Fatal("expected the initial probe to fail")
+	}
+	node.setAvailable(true)
+	conn, err := urlTest.DialContext(ctx, N.NetworkTCP, M.Socksaddr{})
+	if err != nil {
+		t.Fatalf("a recovered member was not retested: %v", err)
+	}
+	conn.Close()
+}
+
+type queuedURLTestOutbound struct {
+	outboundAdapter.Adapter
+	started *sync.WaitGroup
+}
+
+func (o *queuedURLTestOutbound) DialContext(ctx context.Context, _ string, _ M.Socksaddr) (net.Conn, error) {
+	o.started.Done()
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (o *queuedURLTestOutbound) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
+	return nil, errors.New("not used")
+}
+
+type queuedURLTestManager struct {
+	*testOutboundManager
+	started *sync.WaitGroup
+}
+
+func (m *queuedURLTestManager) Outbound(tag string) (adapter.Outbound, bool) {
+	if tag == "working" {
+		m.started.Wait()
+	}
+	return m.testOutboundManager.Outbound(tag)
+}
+
+type delayedURLTestOutbound struct {
+	*fallbackHealthTestOutbound
+}
+
+func (o *delayedURLTestOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	if destination.IsDomain() {
+		select {
+		case <-time.After(time.Millisecond):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return o.fallbackHealthTestOutbound.DialContext(ctx, network, destination)
+}
+
+func TestURLTestInitialSelectionWaitsForQueuedMembers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		var started sync.WaitGroup
+		started.Add(10)
+		manager := &queuedURLTestManager{
+			testOutboundManager: &testOutboundManager{outbounds: make(map[string]adapter.Outbound)},
+			started:             &started,
+		}
+		var outbounds []adapter.Outbound
+		for i := range 10 {
+			node := &queuedURLTestOutbound{
+				Adapter: outboundAdapter.NewAdapter("test", fmt.Sprint("blocked-", i), []string{N.NetworkTCP}, nil),
+				started: &started,
+			}
+			outbounds = append(outbounds, node)
+			manager.outbounds[node.Tag()] = node
+		}
+		working := &delayedURLTestOutbound{newFallbackHealthTestOutbound("working", true)}
+		outbounds = append(outbounds, working)
+		manager.outbounds[working.Tag()] = working
+		group, err := NewURLTestGroup(ctx, manager, log.NewNOPFactory().NewLogger("test"), outbounds, "http://health.test/", nil, 0, 0, 0, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dialCtx, cancelDial := context.WithTimeout(ctx, 3*C.TCPTimeout)
+		defer cancelDial()
+		conn, err := (&URLTest{group: group}).DialContext(dialCtx, N.NetworkTCP, M.Socksaddr{})
+		if err != nil {
+			t.Errorf("a healthy member queued behind ten stalled probes was not selected: %v", err)
+		} else {
+			conn.Close()
+		}
+		cancel()
+		synctest.Wait()
+	})
+}
+
+type bootstrapURLTestOutbound struct {
+	*initialURLTestOutbound
+	dns        *URLTest
+	dnsNetwork string
+}
+
+func (o *bootstrapURLTestOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	if destination.IsDomain() {
+		ctx = adapter.ContextWithDNSTransportTag(ctx, "test-dns")
+		var conn io.Closer
+		var err error
+		dnsServer := M.ParseSocksaddr("1.1.1.1:53")
+		if o.dnsNetwork == "packet" {
+			conn, err = o.dns.ListenPacket(ctx, dnsServer)
+		} else {
+			conn, err = o.dns.DialContext(ctx, o.dnsNetwork, dnsServer)
+		}
+		if err != nil {
+			return nil, err
+		}
+		conn.Close()
+		o.dns.group.access.RLock()
+		ready := o.dns.group.initialTCPReady || o.dns.group.initialUDPReady
+		o.dns.group.access.RUnlock()
+		if ready {
+			return nil, errors.New("bootstrap marked an untested member ready")
+		}
+	}
+	return o.initialURLTestOutbound.DialContext(ctx, network, destination)
+}
+
+func TestURLTestInitialSelectionBootstrapsDNS(t *testing.T) {
+	for _, network := range []string{N.NetworkTCP, N.NetworkUDP, "packet"} {
+		t.Run(network, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			blocked := &fallbackBlockingOutbound{
+				Adapter: outboundAdapter.NewAdapter("test", "blocked", []string{N.NetworkTCP, N.NetworkUDP}, nil),
+				started: make(chan struct{}),
+			}
+			working := &bootstrapURLTestOutbound{
+				initialURLTestOutbound: &initialURLTestOutbound{newFallbackHealthTestOutbound("working", true)},
+				dnsNetwork:             network,
+			}
+			manager := &testOutboundManager{outbounds: map[string]adapter.Outbound{blocked.Tag(): blocked, working.Tag(): working}}
+			group, err := NewURLTestGroup(ctx, manager, log.NewNOPFactory().NewLogger("test"), []adapter.Outbound{blocked, working}, "http://health.test/", nil, 0, 0, 0, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			urlTest := &URLTest{group: group}
+			working.dns = urlTest
+			dialCtx, cancelDial := context.WithTimeout(ctx, time.Second)
+			defer cancelDial()
+			conn, err := urlTest.DialContext(dialCtx, N.NetworkTCP, M.ParseSocksaddr("1.1.1.1:53"))
+			if err != nil {
+				t.Fatalf("DNS bootstrap through a healthy member failed: %v", err)
+			}
+			conn.Close()
+		})
 	}
 }
 

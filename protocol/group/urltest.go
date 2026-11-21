@@ -264,23 +264,9 @@ func (s *URLTest) InterfaceUpdated(ctx context.Context) {
 
 func (s *URLTest) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	s.group.Touch()
-	var outbound adapter.Outbound
-	s.group.access.RLock()
-	switch N.NetworkName(network) {
-	case N.NetworkTCP:
-		outbound = s.group.selectedOutboundTCP
-	case N.NetworkUDP:
-		outbound = s.group.selectedOutboundUDP
-	default:
-		s.group.access.RUnlock()
-		return nil, E.Extend(N.ErrUnknownNetwork, network)
-	}
-	s.group.access.RUnlock()
-	if outbound == nil {
-		outbound, _ = s.group.Select(network)
-	}
-	if outbound == nil {
-		return nil, E.New("missing supported outbound")
+	outbound, err := s.group.selectForDial(ctx, N.NetworkName(network))
+	if err != nil {
+		return nil, err
 	}
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err == nil {
@@ -300,14 +286,9 @@ func memberError(member adapter.Outbound, err error) error {
 
 func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	s.group.Touch()
-	s.group.access.RLock()
-	outbound := s.group.selectedOutboundUDP
-	s.group.access.RUnlock()
-	if outbound == nil {
-		outbound, _ = s.group.Select(N.NetworkUDP)
-	}
-	if outbound == nil {
-		return nil, E.New("missing supported outbound")
+	outbound, err := s.group.selectForDial(ctx, N.NetworkUDP)
+	if err != nil {
+		return nil, err
 	}
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err == nil {
@@ -406,6 +387,10 @@ type URLTestGroup struct {
 	checking                     chan struct{}
 	selectedOutboundTCP          adapter.Outbound
 	selectedOutboundUDP          adapter.Outbound
+	initialTCPReady              bool
+	initialUDPReady              bool
+	initialCheckDone             chan struct{}
+	historyChanged               chan struct{}
 	interruptGroup               *interrupt.Group
 	interruptExternalConnections bool
 	access                       sync.RWMutex
@@ -449,6 +434,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		sharedHistory:                historyStorage(ctx),
 		coordinator:                  coordinator,
 		checking:                     make(chan struct{}, 1),
+		historyChanged:               make(chan struct{}),
 		close:                        make(chan struct{}),
 		pause:                        service.FromContext[pause.Manager](ctx),
 		interruptGroup:               interrupt.NewGroup(),
@@ -471,6 +457,89 @@ func (g *URLTestGroup) deleteHistory(tag string) {
 func (g *URLTestGroup) storeHistory(tag string, history *adapter.URLTestHistory) {
 	g.history.StoreURLTestHistory(tag, history)
 	g.sharedHistory.StoreURLTestHistory(tag, history)
+	g.access.Lock()
+	close(g.historyChanged)
+	g.historyChanged = make(chan struct{})
+	g.access.Unlock()
+}
+
+// The first dial needs a tested member. Wake on each successful probe so a
+// tunnel does not wait for the slowest member of the initial batch.
+func (g *URLTestGroup) selectForDial(ctx context.Context, network string) (adapter.Outbound, error) {
+	dnsTransportTag, _ := adapter.DNSTransportTagFromContext(ctx)
+	var checkDone <-chan struct{}
+	finished := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		g.access.Lock()
+		selected, ready := &g.selectedOutboundTCP, &g.initialTCPReady
+		switch network {
+		case N.NetworkTCP:
+		case N.NetworkUDP:
+			selected, ready = &g.selectedOutboundUDP, &g.initialUDPReady
+		default:
+			g.access.Unlock()
+			return nil, E.Extend(N.ErrUnknownNetwork, network)
+		}
+		if *ready && *selected != nil {
+			outbound := *selected
+			g.access.Unlock()
+			return outbound, nil
+		}
+		outbound, tested := g.selectOutbound(network)
+		if outbound == nil {
+			g.access.Unlock()
+			return nil, E.New("missing supported outbound")
+		}
+		if *ready || tested {
+			*selected, *ready = outbound, true
+			g.access.Unlock()
+			return outbound, nil
+		}
+		if probe := urltest.OutboundFromContext(ctx); probe != nil && dnsTransportTag != "" {
+			// DNS for a probe may detour back through this group. Prefer the
+			// member being probed, without declaring it tested yet.
+			for _, member := range g.outbounds {
+				if common.Contains(member.Network(), network) && MemberTag(member) == probe.Tag() {
+					outbound = member
+					break
+				}
+			}
+			g.access.Unlock()
+			return outbound, nil
+		}
+		if finished {
+			g.access.Unlock()
+			return nil, E.New("no outbound passed the initial URL test for ", network)
+		}
+		if checkDone == nil {
+			if g.initialCheckDone == nil {
+				done := make(chan struct{})
+				g.initialCheckDone = done
+				go func() {
+					g.CheckOutbounds(g.ctx, true)
+					g.access.Lock()
+					g.initialCheckDone = nil
+					close(done)
+					g.access.Unlock()
+				}()
+			}
+			checkDone = g.initialCheckDone
+		}
+		changed := g.historyChanged
+		g.access.Unlock()
+		select {
+		case <-changed:
+		case <-checkDone:
+			finished = true
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-g.ctx.Done():
+			return nil, g.ctx.Err()
+		}
+	}
 }
 
 func (g *URLTestGroup) dialSucceeded() {
@@ -800,6 +869,7 @@ func (g *URLTestGroup) performUpdateCheck() {
 			updated = true
 		}
 		g.selectedOutboundTCP = outbound
+		g.initialTCPReady = g.initialTCPReady || exists
 		selected = true
 	}
 	if outbound, exists := g.selectOutbound(N.NetworkUDP); outbound != nil && (g.selectedOutboundUDP == nil || (exists && outbound != g.selectedOutboundUDP)) {
@@ -807,6 +877,7 @@ func (g *URLTestGroup) performUpdateCheck() {
 			updated = true
 		}
 		g.selectedOutboundUDP = outbound
+		g.initialUDPReady = g.initialUDPReady || exists
 		selected = true
 	}
 	g.access.Unlock()
