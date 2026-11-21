@@ -125,15 +125,24 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 }
 
 func (s *ProviderRemote) Start(stage adapter.StartStage, scope *adapter.Scope) error {
-	if stage != adapter.StartStateStart {
+	if stage == adapter.StartStateInitialize {
+		scope.Add(s.Close)
+		s.cacheFile = service.FromContext[adapter.CacheFile](s.ctx)
+		if s.cacheFile != nil && s.cacheFile.StoreSubscriptions() {
+			if saveSub := s.cacheFile.LoadSubscription(s.Tag()); saveSub != nil {
+				s.restoreProviderCache(saveSub)
+			}
+		}
 		return nil
 	}
-	scope.Add(s.Close)
-	s.cacheFile = service.FromContext[adapter.CacheFile](s.ctx)
-	if s.cacheFile != nil && s.cacheFile.StoreSubscriptions() {
-		if saveSub := s.cacheFile.LoadSubscription(s.Tag()); saveSub != nil {
-			s.restoreProviderCache(saveSub)
+	if stage == adapter.StartStateStarted {
+		if s.ticker != nil {
+			go s.loopUpdate()
 		}
+		return nil
+	}
+	if stage != adapter.StartStateStart {
+		return nil
 	}
 	if s.downloadDetour != "" {
 		outbound, loaded := s.outbound.Outbound(s.downloadDetour)
@@ -146,6 +155,14 @@ func (s *ProviderRemote) Start(stage adapter.StartStage, scope *adapter.Scope) e
 	}
 
 	lastUpdated := s.UpdatedAt()
+	// A fresh group must have its members before a dependent tunnel starts
+	// sending handshakes. A valid cache keeps startup independent of the network.
+	if lastUpdated.IsZero() {
+		if err := s.fetch(interrupt.ContextWithIsExternalConnection(s.ctx, true)); err != nil {
+			return E.Cause(err, "load initial outbound provider ", s.Tag())
+		}
+		lastUpdated = s.UpdatedAt()
+	}
 	if s.updateInterval <= 0 && !lastUpdated.IsZero() {
 		return s.Adapter.Start()
 	}
@@ -154,19 +171,19 @@ func (s *ProviderRemote) Start(stage adapter.StartStage, scope *adapter.Scope) e
 		firstUpdate = time.Nanosecond
 	}
 	s.ticker = time.NewTicker(firstUpdate)
-	go s.loopUpdate()
 	return s.Adapter.Start()
 }
 
 func (s *ProviderRemote) References() []string {
+	references := s.Adapter.References()
 	if s.downloadDetour != "" {
-		return []string{s.downloadDetour}
+		return append(references, s.downloadDetour)
 	}
 	defaultOutbound := s.outbound.Default()
 	if defaultOutbound == nil {
-		return nil
+		return references
 	}
-	return []string{defaultOutbound.Tag()}
+	return append(references, defaultOutbound.Tag())
 }
 
 // Update logs a failure for the schedule and the Clash API alike, since only the log names the

@@ -25,6 +25,11 @@ type ProviderUpdater interface {
 	Update() error
 }
 
+// ProviderDependent names the subscriptions a group needs before it can dial.
+type ProviderDependent interface {
+	ProviderDependencies() []string
+}
+
 type ProviderSubscriptionInfo interface {
 	SubscriptionInfo() SubscriptionInfo
 }
@@ -53,6 +58,7 @@ type ProviderRegistry interface {
 
 type ProviderManager interface {
 	Lifecycle
+	StartProvider(provider Provider) error
 	Providers() []Provider
 	Get(tag string) (Provider, bool)
 	Remove(tag string) error

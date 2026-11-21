@@ -192,6 +192,9 @@ func (s *Selector) Start(stage adapter.StartStage, scope *adapter.Scope) (err er
 		return err
 	}
 	s.selected.Store(outbound)
+	if len(s.providerTags) > 0 {
+		return s.onProviderUpdated(s.providerTags[0])
+	}
 	return nil
 }
 
@@ -226,6 +229,21 @@ func (s *Selector) References() []string {
 		return s.tags[:1]
 	}
 	return []string{selected.Tag()}
+}
+
+func (s *Selector) ProviderDependencies() []string {
+	return providerDependencies(s.provider, s.providerTags, s.useAllProviders)
+}
+
+func providerDependencies(manager adapter.ProviderManager, tags []string, all bool) []string {
+	if !all || manager == nil {
+		return append([]string(nil), tags...)
+	}
+	var result []string
+	for _, provider := range manager.Providers() {
+		result = append(result, provider.Tag())
+	}
+	return result
 }
 
 func (s *Selector) SelectOutbound(tag string) bool {

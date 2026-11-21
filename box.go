@@ -225,8 +225,8 @@ func New(options Options) (*Box, error) {
 	dnsOptions := common.PtrValueOrDefault(options.DNS)
 	endpointManager := endpoint.NewManager(endpointRegistry)
 	inboundManager := inbound.NewManager(inboundRegistry, endpointManager)
-	outboundManager := outbound.NewManager(outboundRegistry, endpointManager, routeOptions.Final)
 	providerManager := provider.NewManager(providerRegistry)
+	outboundManager := outbound.NewManager(outboundRegistry, endpointManager, providerManager, routeOptions.Final)
 	dnsTransportManager := dns.NewTransportManager(dnsTransportRegistry, outboundManager, dnsOptions.Final)
 	serviceManager := boxService.NewManager(serviceRegistry)
 	certificateProviderManager := boxCertificate.NewManager(certificateProviderRegistry)
@@ -621,12 +621,12 @@ func (s *Box) preStart() error {
 		return err
 	}
 	err = s.startComponents(adapter.StartStateStart,
-		boxComponent{"outbound", s.outbound},
-		boxComponent{"provider", s.provider},
 		boxComponent{"dns-transport", s.dnsTransport},
 		boxComponent{"network", s.network},
 		boxComponent{"connection", s.connection},
 		boxComponent{s.httpClientService.Name(), s.httpClientService},
+		boxComponent{"outbound", s.outbound},
+		boxComponent{"provider", s.provider},
 		boxComponent{"router", s.router},
 		boxComponent{"dns-router", s.dnsRouter},
 	)

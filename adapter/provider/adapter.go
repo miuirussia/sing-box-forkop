@@ -129,6 +129,13 @@ func (a *Adapter) Tag() string {
 	return a.providerTag
 }
 
+func (a *Adapter) References() []string {
+	if detour := a.defaultDetour(); detour != "" {
+		return []string{detour}
+	}
+	return nil
+}
+
 func (a *Adapter) Outbounds() []adapter.Outbound {
 	a.access.RLock()
 	defer a.access.RUnlock()

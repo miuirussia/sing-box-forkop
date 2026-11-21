@@ -302,6 +302,14 @@ func (s *Fallback) References() []string {
 	return s.All()
 }
 
+func (s *Fallback) ProviderDependencies() []string {
+	var tags []string
+	for _, group := range s.groups {
+		tags = append(tags, providerDependencies(s.provider, group.providerTags, group.useAllProviders)...)
+	}
+	return tags
+}
+
 func (s *Fallback) Groups() []FallbackGroup {
 	s.access.RLock()
 	defer s.access.RUnlock()

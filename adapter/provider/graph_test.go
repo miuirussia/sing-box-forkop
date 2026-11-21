@@ -188,7 +188,7 @@ func newStageTestProvider(t *testing.T, onStart func(tag string, stage adapter.S
 	if err := endpoints.Start(adapter.StartStateInitialize, scope); err != nil {
 		t.Fatal(err)
 	}
-	manager := outboundAdapter.NewManager(registry, endpoints, "")
+	manager := outboundAdapter.NewManager(registry, endpoints, nil, "")
 	if err := manager.Create(ctx, nil, logger, "direct", "recording", &option.VLESSOutboundOptions{}); err != nil {
 		t.Fatal(err)
 	}

@@ -49,6 +49,7 @@ type Router struct {
 	platformInterface     adapter.PlatformInterface
 	legacyDNSMode         bool
 	rulesAccess           sync.RWMutex
+	clientStarted         bool
 	started               bool
 	closing               bool
 }
@@ -132,19 +133,13 @@ func (r *Router) Initialize(rules []option.DNSRule) error {
 func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	monitor := taskmonitor.New(r.logger, C.StartTimeout)
 	switch stage {
-	case adapter.StartStateStart:
-		scope.Add(func() error {
-			r.rulesAccess.Lock()
-			r.closing = true
-			runtimeRules := r.rules
-			r.rules = nil
-			r.rulesAccess.Unlock()
-			closeRules(runtimeRules)
-			return nil
-		})
-		monitor.Start("initialize DNS client")
-		r.client.Start()
-		monitor.Finish()
+	case adapter.StartStateInitialize, adapter.StartStateStart:
+		if !r.clientStarted {
+			monitor.Start("initialize DNS client")
+			r.client.Start()
+			r.clientStarted = true
+			monitor.Finish()
+		}
 
 		monitor.Start("initialize DNS rules")
 		newRules, legacyDNSMode, modeFlags, err := r.buildRules(true)
@@ -160,8 +155,23 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		}
 		r.rules = newRules
 		r.legacyDNSMode = legacyDNSMode
-		r.started = true
+		// Outbounds need DNS rules during startup. Finalize their mode after the
+		// router has loaded remote rule-set metadata in StartStateStart.
+		r.started = stage == adapter.StartStateStart
 		r.rulesAccess.Unlock()
+		// Keep the initial rules alive for queries already using them when the
+		// final rules replace them.
+		scope.Add(func() error {
+			r.rulesAccess.Lock()
+			r.closing = true
+			r.rules = nil
+			r.rulesAccess.Unlock()
+			closeRules(newRules)
+			return nil
+		})
+		if stage == adapter.StartStateInitialize {
+			return nil
+		}
 		if legacyDNSMode && common.Any(newRules, func(rule adapter.DNSRule) bool { return rule.WithAddressLimit() }) {
 			deprecated.Report(r.ctx, deprecated.OptionLegacyDNSAddressFilter)
 		}

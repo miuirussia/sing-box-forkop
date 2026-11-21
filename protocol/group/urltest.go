@@ -158,6 +158,9 @@ func (s *URLTest) start() (err error) {
 		return err
 	}
 	s.group = group
+	if len(s.providerTags) > 0 {
+		return s.onProviderUpdated(s.providerTags[0])
+	}
 	return nil
 }
 
@@ -223,6 +226,10 @@ func (s *URLTest) References() []string {
 		references = append(references, group.selectedOutboundUDP.Tag())
 	}
 	return references
+}
+
+func (s *URLTest) ProviderDependencies() []string {
+	return providerDependencies(s.provider, s.providerTags, s.useAllProviders)
 }
 
 func (s *URLTest) URLTest(ctx context.Context) (map[string]uint16, error) {

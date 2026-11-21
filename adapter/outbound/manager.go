@@ -17,6 +17,7 @@ var _ adapter.OutboundManager = (*Manager)(nil)
 type Manager struct {
 	registry                adapter.OutboundRegistry
 	endpoint                adapter.EndpointManager
+	provider                adapter.ProviderManager
 	defaultTag              string
 	stageAccess             sync.Mutex
 	access                  sync.RWMutex
@@ -30,10 +31,11 @@ type Manager struct {
 	defaultOutboundFallback func() (adapter.Outbound, error)
 }
 
-func NewManager(registry adapter.OutboundRegistry, endpoint adapter.EndpointManager, defaultTag string) *Manager {
+func NewManager(registry adapter.OutboundRegistry, endpoint adapter.EndpointManager, provider adapter.ProviderManager, defaultTag string) *Manager {
 	return &Manager{
 		registry:      registry,
 		endpoint:      endpoint,
+		provider:      provider,
 		defaultTag:    defaultTag,
 		outboundByTag: make(map[string]adapter.Outbound),
 		dependByTag:   make(map[string][]string),
@@ -46,9 +48,34 @@ func (m *Manager) Initialize(defaultOutboundFallback func() (adapter.Outbound, e
 
 func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	m.stageAccess.Lock()
-	defer m.stageAccess.Unlock()
 	m.startAccess.Lock()
+	outbounds, err := m.prepareStage(stage, scope)
+	if err != nil || stage == adapter.StartStateStart {
+		m.startAccess.Unlock()
+		m.stageAccess.Unlock()
+		if err != nil {
+			return err
+		}
+		// Loading a subscription creates outbounds through WithStage. Do not hold
+		// the stage or mutation locks while starting its dependencies.
+		return m.startOutbounds(scope, append(outbounds, common.Map(m.endpoint.Endpoints(), func(it adapter.Endpoint) adapter.Outbound { return it })...))
+	}
+	defer m.stageAccess.Unlock()
 	defer m.startAccess.Unlock()
+	for _, outbound := range outbounds {
+		lifecycle, isLifecycle := outbound.(adapter.Lifecycle)
+		if !isLifecycle {
+			continue
+		}
+		name := "outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
+		if err := scope.Start(name, lifecycle, stage); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) prepareStage(stage adapter.StartStage, scope *adapter.Scope) ([]adapter.Outbound, error) {
 	m.access.Lock()
 	m.scope = scope
 	m.stage = stage
@@ -57,7 +84,7 @@ func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			defaultEndpoint, loaded := m.endpoint.Get(m.defaultTag)
 			if !loaded {
 				m.access.Unlock()
-				return E.New("default outbound not found: ", m.defaultTag)
+				return nil, E.New("default outbound not found: ", m.defaultTag)
 			}
 			m.defaultOutbound = defaultEndpoint
 		}
@@ -65,93 +92,129 @@ func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			directOutbound, err := m.defaultOutboundFallback()
 			if err != nil {
 				m.access.Unlock()
-				return E.Cause(err, "create direct outbound for fallback")
+				return nil, E.Cause(err, "create direct outbound for fallback")
 			}
 			m.outbounds = append(m.outbounds, directOutbound)
 			m.outboundByTag[directOutbound.Tag()] = directOutbound
 			m.defaultOutbound = directOutbound
 		}
 	}
-	outbounds := m.outbounds
+	outbounds := append([]adapter.Outbound(nil), m.outbounds...)
 	m.access.Unlock()
-	if stage == adapter.StartStateStart {
-		return m.startOutbounds(scope, append(outbounds, common.Map(m.endpoint.Endpoints(), func(it adapter.Endpoint) adapter.Outbound { return it })...))
-	}
-	for _, outbound := range outbounds {
-		lifecycle, isLifecycle := outbound.(adapter.Lifecycle)
-		if !isLifecycle {
-			continue
-		}
-		name := "outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
-		err := scope.Start(name, lifecycle, stage)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return outbounds, nil
 }
 
 func (m *Manager) startOutbounds(scope *adapter.Scope, outbounds []adapter.Outbound) error {
 	started := make(map[string]bool)
-	for {
-		canContinue := false
-	startOne:
-		for _, outboundToStart := range outbounds {
-			outboundTag := outboundToStart.Tag()
-			if started[outboundTag] {
-				continue
+	initialized := make(map[string]bool)
+	visiting := make(map[string]bool)
+	var path []string
+	var startOutbound func(string) error
+	var startProvider func(adapter.Provider) error
+	initializeOutbound := func(current adapter.Outbound) error {
+		if initialized[current.Tag()] {
+			return nil
+		}
+		if endpoint, ok := current.(adapter.Endpoint); ok {
+			if err := m.endpoint.StartEndpoint(endpoint); err != nil {
+				return err
 			}
-			dependencies := outboundToStart.Dependencies()
-			for _, dependency := range dependencies {
-				if !started[dependency] {
-					continue startOne
-				}
-			}
-			started[outboundTag] = true
-			canContinue = true
-			if endpoint, isEndpoint := outboundToStart.(adapter.Endpoint); isEndpoint {
-				err := m.endpoint.StartEndpoint(endpoint)
-				if err != nil {
-					return err
-				}
-				continue
-			}
-			lifecycle, isLifecycle := outboundToStart.(adapter.Lifecycle)
-			if !isLifecycle {
-				continue
-			}
-			name := "outbound/" + outboundToStart.Type() + "[" + outboundTag + "]"
-			err := scope.Start(name, lifecycle, adapter.StartStateStart)
-			if err != nil {
+		} else if lifecycle, ok := current.(adapter.Lifecycle); ok {
+			if err := scope.Start("outbound/"+current.Type()+"["+current.Tag()+"]", lifecycle, adapter.StartStateStart); err != nil {
 				return err
 			}
 		}
-		if len(started) == len(outbounds) {
-			break
+		initialized[current.Tag()] = true
+		return nil
+	}
+	start := func(key string, action func() error) error {
+		if started[key] {
+			return nil
 		}
-		if canContinue {
-			continue
+		if visiting[key] {
+			return E.New("circular outbound/provider dependency: ", strings.Join(append(path, key), " -> "))
 		}
-		currentOutbound := common.Find(outbounds, func(it adapter.Outbound) bool {
-			return !started[it.Tag()]
+		visiting[key] = true
+		path = append(path, key)
+		defer func() {
+			delete(visiting, key)
+			path = path[:len(path)-1]
+		}()
+		if err := action(); err != nil {
+			return err
+		}
+		started[key] = true
+		return nil
+	}
+	startProvider = func(provider adapter.Provider) error {
+		return start("provider/"+provider.Tag(), func() error {
+			if referrer, ok := provider.(adapter.Referrer); ok {
+				for _, tag := range referrer.References() {
+					if err := startOutbound(tag); err != nil {
+						return err
+					}
+				}
+			}
+			return m.provider.StartProvider(provider)
 		})
-		var lintOutbound func(oTree []string, oCurrent adapter.Outbound) error
-		lintOutbound = func(oTree []string, oCurrent adapter.Outbound) error {
-			problemOutboundTag := common.Find(oCurrent.Dependencies(), func(it string) bool {
-				return !started[it]
-			})
-			if common.Contains(oTree, problemOutboundTag) {
-				return E.New("circular outbound dependency: ", strings.Join(oTree, " -> "), " -> ", problemOutboundTag)
+	}
+	startOutbound = func(tag string) error {
+		// A group can download its own subscription through a static or cached
+		// member while the rest of its providers are still starting.
+		if visiting["outbound/"+tag] && initialized[tag] {
+			current, _ := m.Outbound(tag)
+			if group, ok := current.(adapter.OutboundGroup); ok && group.Selected("tcp") != nil {
+				return nil
 			}
-			problemOutbound := common.Find(outbounds, func(it adapter.Outbound) bool {
-				return it.Tag() == problemOutboundTag
-			})
-			if problemOutbound == nil {
-				return E.New("dependency[", problemOutboundTag, "] not found for outbound[", oCurrent.Tag(), "]")
-			}
-			return lintOutbound(append(oTree, problemOutboundTag), problemOutbound)
 		}
-		return lintOutbound([]string{currentOutbound.Tag()}, currentOutbound)
+		return start("outbound/"+tag, func() error {
+			current, loaded := m.Outbound(tag)
+			if !loaded {
+				return E.New("outbound dependency not found: ", tag)
+			}
+			for _, dependency := range current.Dependencies() {
+				if err := startOutbound(dependency); err != nil {
+					return err
+				}
+			}
+			if dependent, ok := current.(adapter.ProviderDependent); ok {
+				var providers []adapter.Provider
+				for _, providerTag := range dependent.ProviderDependencies() {
+					provider, found := m.provider.Get(providerTag)
+					if !found {
+						return E.New("outbound provider not found: ", providerTag)
+					}
+					providers = append(providers, provider)
+					for _, member := range provider.Outbounds() {
+						if err := startOutbound(member.Tag()); err != nil {
+							return err
+						}
+					}
+				}
+				if err := initializeOutbound(current); err != nil {
+					return err
+				}
+				for _, provider := range providers {
+					if err := startProvider(provider); err != nil {
+						return err
+					}
+				}
+			}
+			return initializeOutbound(current)
+		})
+	}
+	for _, current := range outbounds {
+		if err := startOutbound(current.Tag()); err != nil {
+			return err
+		}
+	}
+	// Providers without a group still need to load and schedule updates.
+	if m.provider != nil {
+		for _, provider := range m.provider.Providers() {
+			if err := startProvider(provider); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

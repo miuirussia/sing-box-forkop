@@ -21,12 +21,14 @@ type Manager struct {
 	stage         adapter.StartStage
 	providers     []adapter.Provider
 	providerByTag map[string]adapter.Provider
+	started       map[adapter.Provider]bool
 }
 
 func NewManager(registry adapter.ProviderRegistry) *Manager {
 	return &Manager{
 		registry:      registry,
 		providerByTag: make(map[string]adapter.Provider),
+		started:       make(map[adapter.Provider]bool),
 	}
 }
 
@@ -39,11 +41,32 @@ func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	providers := m.providers
 	m.access.Unlock()
 	for _, provider := range providers {
+		if stage == adapter.StartStateStart && m.started[provider] {
+			continue
+		}
 		err := scope.Start("provider/"+provider.Type()+"["+provider.Tag()+"]", provider, stage)
 		if err != nil {
 			return err
 		}
+		if stage == adapter.StartStateStart {
+			m.started[provider] = true
+		}
 	}
+	return nil
+}
+
+// StartProvider lets outbound startup load a group's subscriptions after their
+// download detours have started, and before the group or its tunnels start.
+func (m *Manager) StartProvider(provider adapter.Provider) error {
+	m.startAccess.Lock()
+	defer m.startAccess.Unlock()
+	if m.started[provider] {
+		return nil
+	}
+	if err := m.scope.Start("provider/"+provider.Type()+"["+provider.Tag()+"]", provider, adapter.StartStateStart); err != nil {
+		return err
+	}
+	m.started[provider] = true
 	return nil
 }
 
@@ -70,6 +93,7 @@ func (m *Manager) Remove(tag string) error {
 		return os.ErrInvalid
 	}
 	delete(m.providerByTag, tag)
+	delete(m.started, provider)
 	m.providers = common.Filter(m.providers, func(it adapter.Provider) bool {
 		return it != provider
 	})
@@ -107,12 +131,16 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory 
 	m.access.Lock()
 	existsProvider, loaded := m.providerByTag[tag]
 	if loaded {
+		delete(m.started, existsProvider)
 		m.providers = common.Filter(m.providers, func(it adapter.Provider) bool {
 			return it != existsProvider
 		})
 	}
 	m.providers = append(m.providers, provider)
 	m.providerByTag[tag] = provider
+	if scope != nil && stage >= adapter.StartStateStart {
+		m.started[provider] = true
+	}
 	m.access.Unlock()
 	if !loaded || scope == nil {
 		return nil
