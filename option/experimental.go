@@ -23,6 +23,7 @@ type CacheFileOptions struct {
 }
 
 type ClashAPIOptions struct {
+	Autodetect                       *AutodetectOptions         `json:"autodetect,omitempty"`
 	ExternalController               string                     `json:"external_controller,omitempty"`
 	ExternalUI                       string                     `json:"external_ui,omitempty"`
 	ExternalUIDownloadURL            string                     `json:"external_ui_download_url,omitempty"`
@@ -42,6 +43,17 @@ type ClashAPIOptions struct {
 	StoreSelected bool `json:"store_selected,omitempty" schema:"omit"`
 	// Deprecated: migrated to global cache file
 	StoreFakeIP bool `json:"store_fakeip,omitempty" schema:"omit"`
+}
+
+type AutodetectOptions struct {
+	Direct          string             `json:"direct" reference:"outbound"`
+	Proxy           string             `json:"proxy" reference:"outbound"`
+	Timeout         badoption.Duration `json:"timeout,omitempty"`
+	Confirmations   int                `json:"confirmations,omitempty"`
+	StallTimeout    badoption.Duration `json:"stall_timeout,omitempty"`
+	ResponseLimit   int                `json:"response_limit,omitempty"`
+	RecheckInterval badoption.Duration `json:"recheck_interval,omitempty"`
+	HistoryLimit    int                `json:"history_limit,omitempty"`
 }
 
 type V2RayAPIOptions struct {

@@ -58,6 +58,7 @@ type Server struct {
 	urlTestHistory *urltest.HistoryStorage
 	clashMode      *clashmode.Manager
 	logDebug       bool
+	autodetect     *autodetector
 
 	// When a group sweep last tested each outbound, whether or not it answered.
 	groupDelayAccess         sync.Mutex
@@ -123,12 +124,20 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		MaxAge:              300,
 	})
 	chiRouter.Use(cors.Handler)
+	if options.Autodetect != nil {
+		detector, err := newAutodetector(s, *options.Autodetect)
+		if err != nil {
+			return nil, err
+		}
+		s.autodetect = detector
+	}
 	chiRouter.Group(func(r chi.Router) {
 		r.Use(authentication(options.Secret))
 		r.Get("/", hello(options.ExternalUI != ""))
 		r.Get("/logs", getLogs(s.ctx, logFactory))
 		r.Get("/traffic", traffic(s.ctx, trafficManager))
 		r.Get("/version", version)
+		r.Get("/autodetect", s.getAutodetect)
 		r.Mount("/configs", configRouter(s, logFactory))
 		r.Mount("/proxies", proxyRouter(s, s.router))
 		r.Mount("/rules", ruleRouter(s.router))
@@ -170,6 +179,9 @@ func (s *Server) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		// the controller does not wait for the archive: GitHub may be slow or out of reach
 		go s.checkAndDownloadExternalUI()
 		scope.Add(s.close)
+		if s.autodetect != nil {
+			s.autodetect.start(s.ctx)
+		}
 		listener, err := s.listen()
 		if err != nil {
 			// The API carries no traffic: an address taken by another program, or not
@@ -239,6 +251,9 @@ func (s *Server) serve(listener net.Listener) {
 // close stops a listen retried in the background and the server.
 func (s *Server) close() error {
 	s.closeOnce.Do(func() { close(s.closed) })
+	if s.autodetect != nil {
+		s.autodetect.close()
+	}
 	return common.Close(
 		common.PtrOrNil(s.httpServer),
 	)
