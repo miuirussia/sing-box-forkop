@@ -16,6 +16,7 @@ import (
 	"time"
 
 	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/wireguard"
@@ -62,7 +63,7 @@ func (k tunnelKeys) client(tag string, extra string) string {
 // startTunnelBox runs a WireGuard server endpoint and the client endpoints the
 // function returns, which hold the one client key the server knows, in one box
 // that logs warnings to the returned file.
-func startTunnelBox(t *testing.T, clients func(tunnelKeys) []string) (*box.Box, string) {
+func startTunnelBox(t *testing.T, finalOutbound string, clients func(tunnelKeys) []string) (*box.Box, string) {
 	t.Helper()
 	serverPrivate, serverPublic := newKeyPair(t)
 	clientPrivate, clientPublic := newKeyPair(t)
@@ -75,8 +76,8 @@ func startTunnelBox(t *testing.T, clients func(tunnelKeys) []string) (*box.Box, 
 		"log": {"level": "warn", "output": %q},
 		"endpoints": [%s],
 		"outbounds": [{"type": "direct", "tag": "direct"}],
-		"route": {"final": "direct"}
-	}`, logPath, strings.Join(endpoints, ","))
+		"route": {"final": %q}
+	}`, logPath, strings.Join(endpoints, ","), finalOutbound)
 	ctx := include.Context(context.Background())
 	options, err := json.UnmarshalExtendedContext[option.Options](ctx, []byte(content))
 	require.NoError(t, err)
@@ -145,7 +146,7 @@ func twoIdenticalClients(keys tunnelKeys) []string {
 // holding one key could not both carry traffic.
 func TestIdenticalEndpointsShareOneTunnel(t *testing.T) {
 	port := startEchoListener(t)
-	instance, _ := startTunnelBox(t, twoIdenticalClients)
+	instance, _ := startTunnelBox(t, "direct", twoIdenticalClients)
 	for i, tag := range []string{"client-a", "client-b", "client-a", "client-b"} {
 		require.NoError(t, dialThrough(t, instance, tag, port), "dial %d through %s", i, tag)
 	}
@@ -159,7 +160,7 @@ func TestIdenticalEndpointsShareOneTunnel(t *testing.T) {
 
 func TestSharedTunnelOutlivesTheEndpointThatCreatedIt(t *testing.T) {
 	port := startEchoListener(t)
-	instance, _ := startTunnelBox(t, twoIdenticalClients)
+	instance, _ := startTunnelBox(t, "direct", twoIdenticalClients)
 	require.NoError(t, dialThrough(t, instance, "client-a", port))
 	creator, loaded := instance.Endpoint().Get("client-a")
 	require.True(t, loaded)
@@ -170,7 +171,7 @@ func TestSharedTunnelOutlivesTheEndpointThatCreatedIt(t *testing.T) {
 // Endpoints that hold one key for one server with other settings cannot share
 // a device and cannot coexist either, which the log has to say.
 func TestSameKeyWithOtherSettingsIsReported(t *testing.T) {
-	instance, logPath := startTunnelBox(t, func(keys tunnelKeys) []string {
+	instance, logPath := startTunnelBox(t, "direct", func(keys tunnelKeys) []string {
 		return []string{keys.client("client-a", ""), keys.client("client-b", `, "mtu": 1280`)}
 	})
 	require.False(t, sharesDevice(t, instance, "client-a", "client-b"))
@@ -184,7 +185,7 @@ func TestSameKeyWithOtherSettingsIsReported(t *testing.T) {
 // with its own session.
 func TestSameKeyForAnotherServerIsNotAConflict(t *testing.T) {
 	_, otherServer := newKeyPair(t)
-	instance, logPath := startTunnelBox(t, func(keys tunnelKeys) []string {
+	instance, logPath := startTunnelBox(t, "direct", func(keys tunnelKeys) []string {
 		other := keys
 		other.serverPublic = otherServer
 		return []string{keys.client("client-a", ""), other.client("client-b", "")}
@@ -193,4 +194,25 @@ func TestSameKeyForAnotherServerIsNotAConflict(t *testing.T) {
 	content, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 	require.NotContains(t, string(content), "holds the same WireGuard key")
+}
+
+func TestKernelEndpointRoutedICMPCapability(t *testing.T) {
+	if os.Getenv("SING_BOX_TEST_KERNEL_WIREGUARD") == "" {
+		t.Skip("set SING_BOX_TEST_KERNEL_WIREGUARD inside a Linux network namespace with CAP_NET_ADMIN")
+	}
+	instance, _ := startTunnelBox(t, "kernel-client", func(keys tunnelKeys) []string {
+		return []string{keys.client("kernel-client", `, "kernel": true`)}
+	})
+	endpoint, loaded := instance.Endpoint().Get("kernel-client")
+	require.True(t, loaded)
+	require.Equal(t, []string{N.NetworkTCP, N.NetworkUDP}, endpoint.Network())
+	metadata := adapter.InboundContext{
+		Network:     N.NetworkICMP,
+		Source:      M.ParseSocksaddr("192.0.2.2"),
+		Destination: M.ParseSocksaddr("10.77.0.1"),
+	}
+	require.Equal(t, adapter.PreMatchReject, instance.Router().PreMatch(metadata, nil).Action)
+	metadata.Network = N.NetworkTCP
+	metadata.Destination.Port = 80
+	require.Equal(t, adapter.PreMatchContinue, instance.Router().PreMatch(metadata, nil).Action)
 }

@@ -11,6 +11,18 @@ import (
 )
 
 func (e *Endpoint) PortAddresses() (netip.Addr, netip.Addr) {
+	if e.tunDevice == nil {
+		var inet4, inet6 netip.Addr
+		for _, prefix := range e.options.Address {
+			switch {
+			case prefix.Addr().Is4() && !inet4.IsValid():
+				inet4 = prefix.Addr()
+			case prefix.Addr().Is6() && !inet6.IsValid():
+				inet6 = prefix.Addr()
+			}
+		}
+		return inet4, inet6
+	}
 	return e.tunDevice.Inet4Address(), e.tunDevice.Inet6Address()
 }
 
@@ -19,6 +31,9 @@ func (e *Endpoint) PortMTU() uint32 {
 }
 
 func (e *Endpoint) WritePackets(packets [][]byte) error {
+	if e.UsesKernel() {
+		return E.New("kernel WireGuard does not support packet injection")
+	}
 	wgDevice := e.device
 	if wgDevice == nil {
 		return E.New("WireGuard device is not ready")
@@ -84,6 +99,12 @@ func (e *Endpoint) WritePackets(packets [][]byte) error {
 }
 
 func (e *Endpoint) AttachReturn(returnPath tun.Return) error {
+	if e.UsesKernel() {
+		return E.New("kernel WireGuard does not support packet return paths")
+	}
+	if e.returnDevice == nil {
+		return E.New("WireGuard device is not ready")
+	}
 	headroom := returnPath.ReturnHeadroom()
 	if headroom > device.MessageTransportOffsetContent {
 		return E.New("return path headroom ", headroom, " exceeds available ", device.MessageTransportOffsetContent)
@@ -107,6 +128,9 @@ func (e *Endpoint) AttachReturn(returnPath tun.Return) error {
 }
 
 func (e *Endpoint) DetachReturn(returnPath tun.Return) error {
+	if e.returnDevice == nil {
+		return nil
+	}
 	currentState := e.returnDevice.state.Load()
 	if currentState != nil && currentState.returnPath == returnPath {
 		e.returnDevice.state.CompareAndSwap(currentState, nil)

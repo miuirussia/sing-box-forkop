@@ -8,6 +8,7 @@ import (
 
 type WireGuardCommonOptions struct {
 	System       bool                             `json:"system,omitempty"`
+	Kernel       bool                             `json:"kernel,omitempty"`
 	Name         string                           `json:"name,omitempty"`
 	MTU          uint32                           `json:"mtu,omitempty"`
 	Address      badoption.Listable[netip.Prefix] `json:"address"`

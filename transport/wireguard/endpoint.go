@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/option"
@@ -31,18 +33,21 @@ import (
 )
 
 type Endpoint struct {
-	options        EndpointOptions
-	peers          []peerConfig
-	ipcConf        string
-	allowedAddress []netip.Prefix
-	tunDevice      Device
-	returnDevice   *returnDeviceWrapper
-	device         *device.Device
-	allowedIPs     *device.AllowedIPs
-	egressPool     *tun.UDPEgressPool
-	pause          pause.Manager
-	pauseCallback  *list.Element[pause.Callback]
-	stateAccess    sync.Mutex
+	options       EndpointOptions
+	peers         []peerConfig
+	ipcConf       string
+	allowedSet    *netipx.IPSet
+	deviceOptions DeviceOptions
+	tunDevice     Device
+	returnDevice  *returnDeviceWrapper
+	kernelDevice  kernelDevice
+	kernelActive  atomic.Bool
+	device        *device.Device
+	allowedIPs    *device.AllowedIPs
+	egressPool    *tun.UDPEgressPool
+	pause         pause.Manager
+	pauseCallback *list.Element[pause.Callback]
+	stateAccess   sync.Mutex
 }
 
 // defaultMTU leaves room for the S4 padding AmneziaWG adds to every data packet, so that a full one
@@ -144,18 +149,30 @@ func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
 		Address:         options.Address,
 		AllowedAddress:  allowedAddresses,
 	}
-	tunDevice, err := NewDevice(deviceOptions)
-	if err != nil {
-		return nil, E.Cause(err, "create WireGuard device")
+	endpoint := &Endpoint{
+		options:       options,
+		peers:         peers,
+		ipcConf:       ipcConf,
+		allowedSet:    allowedIPSet,
+		deviceOptions: deviceOptions,
 	}
-	return &Endpoint{
-		options:        options,
-		peers:          peers,
-		ipcConf:        ipcConf,
-		allowedAddress: allowedAddresses,
-		tunDevice:      tunDevice,
-		returnDevice:   &returnDeviceWrapper{Device: tunDevice},
-	}, nil
+	if options.KernelKind == "" {
+		err = endpoint.createUserspaceDevice()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return endpoint, nil
+}
+
+func (e *Endpoint) createUserspaceDevice() error {
+	tunDevice, err := NewDevice(e.deviceOptions)
+	if err != nil {
+		return E.Cause(err, "create WireGuard device")
+	}
+	e.tunDevice = tunDevice
+	e.returnDevice = &returnDeviceWrapper{Device: tunDevice}
+	return nil
 }
 
 func (e *Endpoint) Start(postStart bool) error {
@@ -165,73 +182,24 @@ func (e *Endpoint) Start(postStart bool) error {
 	if postStart != hasDomainPeer {
 		return nil
 	}
-	var (
-		bind          conn.Bind
-		connectDomain bool
-	)
-	udpListener, isUDPListener := common.Cast[dialer.UDPListener](e.options.Dialer)
-	if isUDPListener {
-		listenerControl, egressEnabled := udpListener.UDPListenerControl()
-		standardBind := conn.NewStdNetBind(listenerControl).(*conn.StdNetBind)
-		if e.options.ListenPort == 0 && len(e.peers) == 1 && e.peers[0].endpoint.IsValid() {
-			standardBind.SetSinglePeerMode()
+	if e.options.KernelKind != "" {
+		kernel, err := startKernelDevice(e)
+		if err == nil {
+			e.kernelDevice = kernel
+			e.kernelActive.Store(true)
+			e.registerPause()
+			return nil
 		}
-		if egressEnabled {
-			egressPoolOptions := e.options.EgressPoolOptions
-			egressPoolOptions.Control = listenerControl
-			e.egressPool = tun.NewUDPEgressPool(egressPoolOptions)
-			standardBind.SetEgressProvider(e.egressPool)
+		if !errors.Is(err, errKernelUnavailable) {
+			return err
 		}
-		powerManager := service.FromContext[*powerreport.Manager](e.options.Context)
-		if powerManager != nil {
-			recorder := powerManager.Recorder()
-			if recorder != nil {
-				attribution := &powerreport.Attribution{Endpoint: e.options.Tag}
-				counter := recorder.TrafficCounter(powerreport.TrafficEndpoint, e.options.Tag)
-				standardBind.SetIOActivityFuncs(func(size int) {
-					counter.CountIn(int64(size))
-					recorder.Touch(powerreport.DirectionInbound, size, attribution)
-				}, func(size int) {
-					counter.CountOut(int64(size))
-					recorder.Touch(powerreport.DirectionOutbound, size, attribution)
-				})
-			}
-		}
-		bind = standardBind
-	} else {
-		var (
-			isConnect   bool
-			connectAddr M.Socksaddr
-			reserved    [3]uint8
-		)
-		// A lone peer is dialed through the detour by its address, or by its
-		// name, which the detour resolves where it connects as it would for any
-		// other connection. Racing the addresses of the name from here would send
-		// them all through one proxied UDP session, which a proxy that cannot
-		// reach one of them may end for all.
-		if len(e.peers) == 1 {
-			reserved = e.peers[0].reserved
-			if e.peers[0].endpoint.IsValid() {
-				isConnect = true
-				connectAddr = M.SocksaddrFromNetIP(e.peers[0].endpoint)
-			} else if e.peers[0].destination.IsDomain() {
-				isConnect = true
-				connectAddr = e.peers[0].destination
-				connectDomain = true
-			}
-		}
-		bind = NewClientBind(e.options.Context, e.options.Logger, e.options.Dialer, isConnect, connectAddr, reserved)
-	}
-	if isUDPListener || len(e.peers) > 1 {
-		for _, peer := range e.peers {
-			if peer.endpoint.IsValid() && peer.reserved != [3]uint8{} {
-				bind.SetReservedForEndpoint(peer.endpoint, peer.reserved)
-			}
+		e.options.Logger.Info(err, ", using userspace")
+		err = e.createUserspaceDevice()
+		if err != nil {
+			return err
 		}
 	}
-	if e.options.Phobos != nil {
-		bind = phobos.NewBind(bind, *e.options.Phobos)
-	}
+	bind, connectDomain := e.createBind()
 	err := e.tunDevice.Start()
 	if err != nil {
 		return err
@@ -380,17 +348,98 @@ func (e *Endpoint) Start(postStart bool) error {
 		return E.Cause(err, "setup wireguard")
 	}
 	e.device = wgDevice
+	e.allowedIPs = wgDevice.AllowedIPs()
+	e.registerPause()
+	return nil
+}
+
+func (e *Endpoint) createBind() (conn.Bind, bool) {
+	var (
+		bind          conn.Bind
+		connectDomain bool
+	)
+	udpListener, isUDPListener := common.Cast[dialer.UDPListener](e.options.Dialer)
+	if isUDPListener {
+		listenerControl, egressEnabled := udpListener.UDPListenerControl()
+		standardBind := conn.NewStdNetBind(listenerControl).(*conn.StdNetBind)
+		if e.options.ListenPort == 0 && len(e.peers) == 1 && e.peers[0].endpoint.IsValid() {
+			standardBind.SetSinglePeerMode()
+		}
+		if egressEnabled {
+			egressPoolOptions := e.options.EgressPoolOptions
+			egressPoolOptions.Control = listenerControl
+			e.egressPool = tun.NewUDPEgressPool(egressPoolOptions)
+			standardBind.SetEgressProvider(e.egressPool)
+		}
+		powerManager := service.FromContext[*powerreport.Manager](e.options.Context)
+		if powerManager != nil {
+			recorder := powerManager.Recorder()
+			if recorder != nil {
+				attribution := &powerreport.Attribution{Endpoint: e.options.Tag}
+				counter := recorder.TrafficCounter(powerreport.TrafficEndpoint, e.options.Tag)
+				standardBind.SetIOActivityFuncs(func(size int) {
+					counter.CountIn(int64(size))
+					recorder.Touch(powerreport.DirectionInbound, size, attribution)
+				}, func(size int) {
+					counter.CountOut(int64(size))
+					recorder.Touch(powerreport.DirectionOutbound, size, attribution)
+				})
+			}
+		}
+		bind = standardBind
+	} else {
+		var (
+			isConnect   bool
+			connectAddr M.Socksaddr
+			reserved    [3]uint8
+		)
+		// A lone peer is dialed through the detour by its address, or by its
+		// name, which the detour resolves where it connects as it would for any
+		// other connection. Racing the addresses of the name from here would send
+		// them all through one proxied UDP session, which a proxy that cannot
+		// reach one of them may end for all.
+		if len(e.peers) == 1 {
+			reserved = e.peers[0].reserved
+			if e.peers[0].endpoint.IsValid() {
+				isConnect = true
+				connectAddr = M.SocksaddrFromNetIP(e.peers[0].endpoint)
+			} else if e.peers[0].destination.IsDomain() {
+				isConnect = true
+				connectAddr = e.peers[0].destination
+				connectDomain = true
+			}
+		}
+		bind = NewClientBind(e.options.Context, e.options.Logger, e.options.Dialer, isConnect, connectAddr, reserved)
+	}
+	if isUDPListener || len(e.peers) > 1 {
+		for _, peer := range e.peers {
+			if peer.endpoint.IsValid() && peer.reserved != [3]uint8{} {
+				bind.SetReservedForEndpoint(peer.endpoint, peer.reserved)
+			}
+		}
+	}
+	if e.options.Phobos != nil {
+		bind = phobos.NewBind(bind, *e.options.Phobos)
+	}
+	return bind, connectDomain
+}
+
+func (e *Endpoint) registerPause() {
 	e.pause = service.FromContext[pause.Manager](e.options.Context)
 	if e.pause != nil {
 		e.pauseCallback = e.pause.RegisterCallback(e.onPauseUpdated)
 	}
-	e.allowedIPs = wgDevice.AllowedIPs()
-	return nil
 }
 
 func (e *Endpoint) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	if !destination.Addr.IsValid() {
 		return nil, E.Cause(os.ErrInvalid, "invalid non-IP destination")
+	}
+	if e.UsesKernel() {
+		return e.kernelDevice.DialContext(ctx, network, destination)
+	}
+	if e.tunDevice == nil {
+		return nil, E.New("WireGuard device is not ready")
 	}
 	return e.tunDevice.DialContext(ctx, network, destination)
 }
@@ -398,6 +447,12 @@ func (e *Endpoint) DialContext(ctx context.Context, network string, destination 
 func (e *Endpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	if !destination.Addr.IsValid() {
 		return nil, E.Cause(os.ErrInvalid, "invalid non-IP destination")
+	}
+	if e.UsesKernel() {
+		return e.kernelDevice.ListenPacket(ctx, destination)
+	}
+	if e.tunDevice == nil {
+		return nil, E.New("WireGuard device is not ready")
 	}
 	return e.tunDevice.ListenPacket(ctx, destination)
 }
@@ -407,19 +462,42 @@ func (e *Endpoint) Close() error {
 		e.pause.UnregisterCallback(e.pauseCallback)
 		e.pauseCallback = nil
 	}
-	if e.egressPool != nil {
-		e.egressPool.Close()
-		e.egressPool = nil
+	if !e.UsesKernel() {
+		e.closeEgressPool()
 	}
 	e.stateAccess.Lock()
 	defer e.stateAccess.Unlock()
+	if e.UsesKernel() {
+		return e.kernelDevice.Close()
+	}
 	if e.device != nil {
 		e.device.Down()
 		e.device.Close()
 		e.device = nil
 		return nil
 	}
-	return e.tunDevice.Close()
+	if e.tunDevice != nil {
+		return e.tunDevice.Close()
+	}
+	return nil
+}
+
+func (e *Endpoint) closeEgressPool() {
+	if e.egressPool != nil {
+		e.egressPool.Close()
+		e.egressPool = nil
+	}
+}
+
+func (e *Endpoint) UsesKernel() bool {
+	return e.kernelActive.Load()
+}
+
+func (e *Endpoint) PreferredAddress(address netip.Addr) bool {
+	if e.UsesKernel() {
+		return e.allowedSet.Contains(address)
+	}
+	return e.Lookup(address) != nil
 }
 
 func (e *Endpoint) Lookup(address netip.Addr) *device.Peer {
@@ -430,6 +508,11 @@ func (e *Endpoint) Lookup(address netip.Addr) *device.Peer {
 }
 
 func (e *Endpoint) BindUpdate() error {
+	if e.UsesKernel() {
+		e.stateAccess.Lock()
+		defer e.stateAccess.Unlock()
+		return e.kernelDevice.BindUpdate()
+	}
 	if e.device == nil {
 		return nil
 	}
@@ -446,6 +529,13 @@ func (e *Endpoint) onPauseUpdated(event int) {
 func (e *Endpoint) updateNetworkPause() {
 	e.stateAccess.Lock()
 	defer e.stateAccess.Unlock()
+	if e.UsesKernel() {
+		err := e.kernelDevice.SetUp(!e.pause.IsNetworkPaused())
+		if err != nil {
+			e.options.Logger.Error(E.Cause(err, "update kernel WireGuard interface state"))
+		}
+		return
+	}
 	if e.device == nil {
 		return
 	}

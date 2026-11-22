@@ -178,11 +178,17 @@ func newEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		udpTimeout = C.UDPTimeout
 	}
 	networkManager := service.FromContext[adapter.NetworkManager](ctx)
+	var kernelKind string
+	if options.Kernel {
+		kernelKind = endpointType
+	}
 	device := &sharedDevice{registry: registry, configuration: configuration, identities: identities}
 	wgEndpoint, err := wireguard.NewEndpoint(wireguard.EndpointOptions{
 		Context:         ctx,
 		Logger:          logger,
 		System:          options.System,
+		KernelKind:      kernelKind,
+		DialerOptions:   options.DialerOptions,
 		Handler:         device,
 		UDPTimeout:      udpTimeout,
 		ICMPTimeout:     C.ICMPTimeout,
@@ -272,6 +278,14 @@ func (w *Endpoint) MultiplexEnabled() bool {
 	return true
 }
 
+func (w *Endpoint) Network() []string {
+	networks := w.Adapter.Network()
+	if w.endpoint.UsesKernel() {
+		return networks[:2:2] // TCP and UDP precede ICMP in the adapter.
+	}
+	return networks
+}
+
 func (w *Endpoint) InterfaceUpdated(ctx context.Context) {
 	if !w.started.Load() || w.device.primary() != w {
 		return
@@ -292,6 +306,12 @@ func (w *Endpoint) updateBind(ctx context.Context) {
 }
 
 func (w *Endpoint) PreMatchFlow(network string, destination netip.Addr) adapter.PreMatchAction {
+	if w.endpoint.UsesKernel() {
+		if network == N.NetworkICMP {
+			return adapter.PreMatchReject
+		}
+		return adapter.PreMatchContinue
+	}
 	return adapter.PreMatchFlow
 }
 
@@ -451,5 +471,5 @@ func (w *Endpoint) PreferredAddress(metadata *adapter.InboundContext, address ne
 	if !w.started.Load() {
 		return false
 	}
-	return w.endpoint.Lookup(address) != nil
+	return w.endpoint.PreferredAddress(address)
 }

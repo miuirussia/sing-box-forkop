@@ -71,7 +71,8 @@ func TestSharedDeviceKeyCoversEverySetting(t *testing.T) {
 		"type": func(endpointType *string, _ *option.WireGuardCommonOptions, _ *wireguard.AmneziaOptions) {
 			*endpointType = "wireguard"
 		},
-		"mtu": func(_ *string, it *option.WireGuardCommonOptions, _ *wireguard.AmneziaOptions) { it.MTU = 1420 },
+		"kernel": func(_ *string, it *option.WireGuardCommonOptions, _ *wireguard.AmneziaOptions) { it.Kernel = true },
+		"mtu":    func(_ *string, it *option.WireGuardCommonOptions, _ *wireguard.AmneziaOptions) { it.MTU = 1420 },
 		"address": func(_ *string, it *option.WireGuardCommonOptions, _ *wireguard.AmneziaOptions) {
 			it.Address = badoption.Listable[netip.Prefix]{netip.MustParsePrefix("10.8.1.6/32")}
 		},

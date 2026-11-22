@@ -113,6 +113,16 @@ sing-box geodata export --kind geoip --file geoip.dat --tag ru --output ru.srs
 
 Ядро распространяется по лицензии [GPL-3.0-or-later](LICENSE).
 
+## WireGuard и AmneziaWG в ядре Linux
+
+Добавьте `"kernel": true` в настройки endpoint `wireguard`, `amneziawg` или `phobos`. Нужны права `CAP_NET_ADMIN` и соответствующий модуль Linux. Phobos использует модуль `wireguard` и встроенный обфускатор на локальном UDP-сокете.
+
+При недоступности модуля, недостатке прав или несовместимых параметрах sing-box пишет причину в лог и использует программную реализацию. С `"system": false` (по умолчанию) сетевой стек работает в памяти sing-box через gVisor. С `"system": true` sing-box создаёт системный TUN и использует сокеты ОС. В обоих случаях WireGuard шифрует пакеты в процессе sing-box.
+
+Для прямых WireGuard и AmneziaWG fallback включается, например, при `detour`, `bind_interface`, ненулевых `reserved` или `auto_detect_interface` без марки auto-redirect. Для Phobos внешний UDP обслуживает встроенный обфускатор, поэтому `detour` и привязка внешнего сокета доступны. Когда sing-box сам разрешает домен peer и получает несколько разных IP, он использует userspace, где есть перебор адресов. Единственный IP передаётся ядру при запуске.
+
+В режиме `kernel` входящие IP-пакеты обрабатывает Linux. Отдельная таблица маршрутизации применяется к сокетам, привязанным к VPN-интерфейсу, и к трафику с исходным IP этого интерфейса. Внешние пакеты WireGuard и AmneziaWG следуют системным маршрутам с учётом `routing_mark`. В правилах маршрутизации sing-box endpoint в режиме `kernel` обслуживает TCP и UDP. Для пересылки ICMP между endpoint’ами sing-box используйте userspace.
+
 ## Phobos
 
 Клиентский endpoint `phobos` подключается к WireGuard-пресетам Phobos. Нужна сборка с `with_wireguard` и `with_gvisor`. Обфускатор встроен; отдельный процесс не требуется.
@@ -122,6 +132,7 @@ sing-box geodata export --kind geoip --file geoip.dat --tag ru --output ru.srs
   "endpoints": [{
     "type": "phobos",
     "tag": "phobos-vpn",
+    "kernel": true,
     "address": ["10.8.0.2/32"],
     "private_key": "<WireGuard private key>",
     "peers": [{

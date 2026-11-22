@@ -53,6 +53,23 @@ func Normalize(raw *option.PhobosObfuscationOptions) (*Options, error) {
 	return o, nil
 }
 
+// crc8Table replaces the eight bit steps of the reflected 0x8c polynomial.
+var crc8Table = func() [256]byte {
+	var table [256]byte
+	for i := range table {
+		crc := byte(i)
+		for range 8 {
+			if crc&1 != 0 {
+				crc = crc>>1 ^ 0x8c
+			} else {
+				crc >>= 1
+			}
+		}
+		table[i] = crc
+	}
+	return table
+}()
+
 func xor(b []byte, key string, limit int) {
 	n := len(b)
 	if limit > 0 && limit < n {
@@ -60,16 +77,14 @@ func xor(b []byte, key string, limit int) {
 	}
 	var crc byte
 	base := byte(n + len(key))
+	keyIndex := 0
 	for i := 0; i < n; i++ {
-		crc ^= key[i%len(key)] + base
-		for j := 0; j < 8; j++ {
-			if crc&1 != 0 {
-				crc = crc>>1 ^ 0x8c
-			} else {
-				crc >>= 1
-			}
-		}
+		crc = crc8Table[crc^(key[keyIndex]+base)]
 		b[i] ^= crc
+		keyIndex++
+		if keyIndex == len(key) {
+			keyIndex = 0
+		}
 	}
 }
 

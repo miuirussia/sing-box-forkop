@@ -202,7 +202,7 @@ func resolveOutbound(outbound adapter.Outbound, network string) ([]adapter.Outbo
 		chain = append(chain, outbound)
 	}
 	if !common.Contains(outbound.Network(), network) {
-		return nil, E.New(strings.ToUpper(network), " is not supported by outbound: ", outbound.Tag())
+		return chain, E.New(strings.ToUpper(network), " is not supported by outbound: ", outbound.Tag())
 	}
 	return chain, nil
 }
@@ -516,7 +516,7 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 		}
 	}
 	chain, err := resolveOutbound(outbound, metadata.Network)
-	if err != nil {
+	if len(chain) == 0 {
 		return continueResult
 	}
 	outbound = chain[len(chain)-1]
@@ -525,6 +525,10 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 		return continueResult
 	}
 	flowAction := flowOutbound.PreMatchFlow(metadata.Network, metadata.Destination.Addr)
+	// An outbound may explicitly reject a flow even if it cannot carry that network.
+	if err != nil && flowAction != adapter.PreMatchReject {
+		return continueResult
+	}
 	if flowAction != adapter.PreMatchFlow {
 		return adapter.PreMatchResult{Action: flowAction, Outbound: outbound}
 	}
