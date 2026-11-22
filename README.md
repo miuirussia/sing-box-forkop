@@ -1,171 +1,123 @@
 # sing-box-forkop
 
-## Что нового
+Форк sing-box, который Forkop использует на OpenWrt.
 
-- **Phobos** — клиент WireGuard с обфускацией STUN, MEDIA, NONE и AUTO
-- **AmneziaWG 2.0 и 3.x** — обфускация WireGuard
-- **Cloudflare WARP** — WARP через WireGuard с обфускацией AmneziaWG
-- **TrustTunnel** — протокол AdGuard, клиент и сервер
-- **mieru** — клиент и сервер
-- **VLESS Encryption** — шифрование VLESS из Xray, клиент и сервер
-- **XHTTP** — транспорт Xray, в том числе поверх HTTP/3
-- **Fallback** — первый рабочий сервер по уровням приоритета
-- **Единая задержка** — время запроса без установки соединения
-- **Подписки** — ссылки, base64, Clash и mihomo, sing-box, Xray, SIP008
-- **Парсер ссылок** — сервер задаётся одной ссылкой
-- **DNS Fallback** — несколько DNS-серверов, переключение при сбоях
-- **Текстовые rule set** — домены и подсети по одному в строке
-- **DAT → SRS** — потоковое чтение geosite/geoip V2Ray, индекс тегов и экспорт выбранного тега без промежуточного JSON
-- **Экспорт подсетей** — адреса наборов правил через Clash API для nftables
-- **Адрес выхода** — IP и страна выхода подключения через Clash API
-- **Tailscale в Clash API** — состояние, выходной узел и пинг устройств сети
-- **Оптимизация под роутеры**
-- **Улучшения и исправления**
-
-## Сборки
-
-Для баз V2Ray/Xray доступны команды:
-
-```sh
-sing-box geodata list --kind geosite --file geosite.dat --output index.json
-sing-box geodata tags --index index.json --search youtube --offset 0
-sing-box geodata export --kind geosite --file geosite.dat --index index.json --tag youtube --output youtube.srs
-sing-box geodata export --kind geosite --file geosite.dat --index index.json --tag 'google@!cn' --output google.srs
-sing-box geodata export --kind geoip --file geoip.dat --tag ru --output ru.srs
-```
-
-`list` читает базу с буфером 32 КиБ; `tags` возвращает до 200 результатов. Индекс проверяется по размеру и времени изменения исходного файла. Экспорт компилирует один тег непосредственно в SRS, сохраняя типы доменов и IPv4/IPv6 CIDR, включая `/0`. GeoIP `inverse_match` отклоняется, поскольку Forkop экспортирует положительные подсети в nftables. Результаты публикуются атомарно, существующий SRS сохраняется при ошибке.
-
-`sing-box geodata fetch --url URL --output source.dat` скачивает базу напрямую потоком, с лимитом 128 МиБ и тайм-аутом 10 минут. Для загрузки через выбранный outbound работает локальный аутентифицированный `POST /geodata/download` Clash API; ответ предназначен для менеджера Forkop и содержит маркер завершения после данных. Старые команды `geosite` и `geoip` по-прежнему обслуживают формат `.db`.
-
-Сборка задаётся тегами Go. `with_clash_api` и `with_utls` есть в любой сборке, остальные необязательны.
-
-| Тег | Что добавляет | tiny | base | full |
-| --- | --- | :---: | :---: | :---: |
-| `with_quic` | Hysteria, Hysteria2, TUIC, QUIC, DNS over QUIC и HTTP/3, XHTTP поверх HTTP/3 | ✓ | ✓ | ✓ |
-| `with_gvisor` | сетевой стек в памяти для туннелей | | ✓ | ✓ |
-| `with_wireguard` | WireGuard, AmneziaWG, Phobos, WARP | | ✓ | ✓ |
-| `with_openvpn` | OpenVPN, клиент и сервер | | ✓ | ✓ |
-| `with_trusttunnel` | TrustTunnel, клиент и сервер | | ✓ | ✓ |
-| `with_vmess` | VMess | | ✓ | ✓ |
-| `with_anytls` | AnyTLS | | ✓ | ✓ |
-| `with_tailscale` | Tailscale | | | ✓ |
-| `with_openconnect` | OpenConnect | | | ✓ |
-| `with_naive` | NaiveProxy, клиент и сервер | | | ✓ |
-| `with_mieru` | mieru | | | ✓ |
-| `with_snell`, `with_ssh`, `with_shadowtls`, `with_tor` | Snell, SSH, ShadowTLS, Tor | | | ✓ |
-
-На `386-softfloat`, `armv6`, `armv5`, `mipsle-mips32`, `mips`, `mips64le` и `mips64` сборка full выходит без NaiveProxy, для них не собирается библиотека cronet.
-
-Теги туннелей `with_wireguard`, `with_openvpn`, `with_openconnect` и `with_tailscale` работают только вместе с `with_gvisor`. Набор тегов, который не совпадает ни с одной сборкой, называется **custom**.
+- WireGuard с AmneziaWG 2.0 и 3.x, клиент Phobos, Cloudflare WARP с поддержкой AmneziaWG.
+- TrustTunnel и mieru (клиент и сервер), VLESS Encryption на входе и выходе, XHTTP в том числе поверх HTTP/3.
+- Подписки из списков ссылок, в base64 и в форматах Clash/mihomo, sing-box, Xray и SIP008. Отдельный сервер тоже можно задать ссылкой.
+- Fallback выбирает первый рабочий сервер по приоритету. Замер задержки учитывает время запроса без установки соединения. DNS Fallback переключает DNS-сервер при сбое.
+- Текстовые наборы правил принимают домены и подсети по одному на строку. Clash API отдаёт подсети для nftables, IP и страну выхода, состояние Tailscale и его выходной узел, а также позволяет пинговать устройства Tailscale.
 
 ## Сборка
 
-Понадобятся Linux или WSL, git, а для пакетов apk ещё apk-tools. Нужную версию Go `build.sh` скачает сам.
+Нужны Linux или WSL и git, для APK ещё `apk-tools`. Скрипт сам скачает Go. Результат будет в `dist/`.
 
 ```sh
-./build.sh --list                          # сборки, теги, цели и архитектуры
-./build.sh --arch aarch64_cortex-a53       # пакеты ipk и apk для архитектуры роутера
-./build.sh arm64 mipsle                    # пакеты для выбранных целей
-./build.sh --variant full arm64            # сборка full
-./build.sh --binary-only amd64             # только бинарник
+./build.sh --list                      # варианты, теги и архитектуры
+./build.sh --arch aarch64_cortex-a53    # IPK и APK для архитектуры OpenWrt
+./build.sh arm64 mipsle                # пакеты для двух целей
+./build.sh --variant full arm64
+./build.sh --binary-only amd64
 ```
 
-Готовые пакеты появятся в `dist/`. Сборка full при первом запуске скачивает исходники cronet и тулчейн Chromium, а это несколько гигабайт.
+| Вариант | Что входит |
+| --- | --- |
+| `tiny` | QUIC, Hysteria, Hysteria2, TUIC, DNS over QUIC и HTTP/3, XHTTP поверх HTTP/3 |
+| `base` (по умолчанию) | Всё из `tiny` плюс gVisor, WireGuard, AmneziaWG, Phobos, WARP, OpenVPN, TrustTunnel, VMess и AnyTLS |
+| `full` | Всё из `base` плюс Tailscale, OpenConnect, NaiveProxy, mieru, Snell, SSH, ShadowTLS и Tor |
 
-### Своя сборка
+Clash API и uTLS есть во всех вариантах. `full` с NaiveProxy при первой сборке скачивает несколько гигабайт исходников cronet и тулчейна Chromium. На целях без библиотеки cronet скрипт исключает NaiveProxy. Эти цели перечислены в `./build.sh --list`.
 
-Параметр `--tags` меняет набор тегов выбранной сборки:
+Через `--tags` можно задать весь список необязательных тегов или изменить набор выбранного варианта знаками `+` и `-`. Метка `custom` означает, что набор отличается от всех трёх вариантов. Для `with_wireguard`, `with_openvpn`, `with_openconnect` и `with_tailscale` нужен `with_gvisor`.
 
 ```sh
-./build.sh --tags +with_openconnect arm64                     # base и OpenConnect
-./build.sh --variant full --tags -with_tor,-with_ssh arm64    # full без Tor и SSH
-./build.sh --tags with_quic,with_gvisor,with_wireguard arm64  # только эти теги
+./build.sh --tags +with_openconnect arm64
+./build.sh --variant full --tags -with_tor,-with_ssh arm64
+./build.sh --tags with_quic,with_gvisor,with_wireguard arm64
 ```
 
-Такой пакет получает сборку `custom`. Forkop с ним работает и показывает на странице только то, что в нём есть.
+## Геоданные V2Ray/Xray
+
+`geodata` читает DAT потоком и экспортирует один тег прямо в SRS. Команды `geosite` и `geoip` работают с форматом `.db`.
+
+```sh
+sing-box geodata fetch --url URL --output geosite.dat
+sing-box geodata list --kind geosite --file geosite.dat --output index.json
+sing-box geodata tags --index index.json --search youtube --offset 0
+sing-box geodata export --kind geosite --file geosite.dat --index index.json --tag youtube --output youtube.srs
+sing-box geodata export --kind geoip --file geoip.dat --tag ru --output ru.srs
+```
+
+Индекс привязан к размеру и времени изменения DAT. Поиск выдаёт до 200 тегов на страницу. Для geosite можно указать тег с фильтром по атрибуту, например `--tag 'google@!cn'`. Экспорт сохраняет типы доменов и IPv4/IPv6 CIDR, включая `/0`. Для GeoIP поддерживаются только прямые совпадения (`inverse_match: false`). При ошибке экспорта существующий SRS остаётся на месте.
+
+Лимит `fetch` составляет 128 МиБ, тайм-аут 10 минут. Загрузку через выбранный outbound выполняет локальный `POST /geodata/download` Clash API с авторизацией.
 
 ## Autodetect
 
-`experimental.clash_api.autodetect` сравнивает HTTPS-запросы через прямой и прокси-выход для недавних соединений с признаками сбоя. Результаты доступны в `GET /autodetect` с теми же настройками авторизации, что и у остальных методов Clash API.
+Для недавних соединений с признаками сбоя Autodetect сравнивает HTTPS-запросы через прямой выход и прокси. Укажите два разных тега в `experimental.clash_api.autodetect`.
 
 ```json
 {
-  "experimental": {
-    "clash_api": {
-      "autodetect": {
-        "direct": "direct-out",
-        "proxy": "Main",
-        "ports": [443, 8443]
-      }
-    }
-  }
+  "direct": "direct-out",
+  "proxy": "Main",
+  "ports": [443, 8443]
 }
 ```
 
-`direct` и `proxy` — теги разных выходов из вашей конфигурации. `ports` принимает один порт или список портов от 1 до 65535; по умолчанию проверяется только 443. На каждом выбранном порту используется HTTPS с проверкой сертификата. Проверки сохраняют исходный порт и SNI домена; для нестандартного порта HTTP Host включает порт. Локальные адреса и соединения UDP не проверяются.
+`ports` принимает один порт или список портов от 1 до 65535. По умолчанию проверяется порт 443. Проверки сохраняют SNI и порт исходного соединения, проверяют сертификат и пропускают локальные адреса и UDP. Результаты возвращает `GET /autodetect` с обычной авторизацией Clash API.
 
-## Зависимости
+## WireGuard в ядре Linux
 
-Исправленные зависимости лежат в [`third_party`](third_party). Это wireguard-go с AmneziaWG, gVisor, sing-openvpn и sing-vmess.
+Добавьте `"kernel": true` в endpoint `wireguard`, `amneziawg`, `phobos` или `warp`. Нужны `CAP_NET_ADMIN` и модуль `wireguard` либо `amneziawg`. WARP с обфускацией пробует `amneziawg`, обычный WARP использует `wireguard`. Phobos помещает внутренний UDP-порт WireGuard в отдельное сетевое пространство имён, для чего нужен `CAP_SYS_ADMIN`.
 
-## Лицензия
+При недоступном модуле, нехватке прав или несовместимых настройках sing-box пишет причину в лог и переключается на userspace. Там туннель использует gVisor по умолчанию или системный TUN с `"system": true`. WARP сохраняет обфускацию при переключении.
 
-Ядро распространяется по лицензии [GPL-3.0-or-later](LICENSE).
-
-## WireGuard и AmneziaWG в ядре Linux
-
-Добавьте `"kernel": true` в настройки endpoint `wireguard`, `amneziawg`, `phobos` или `warp`. Нужны права `CAP_NET_ADMIN` и соответствующий модуль Linux. WARP использует модуль `wireguard` для обычного подключения и пробует `amneziawg`, когда настроена обфускация. Phobos использует модуль `wireguard` и изолирует его внутренний UDP-порт в отдельном сетевом namespace. Для создания namespace дополнительно нужны права `CAP_SYS_ADMIN`.
-
-При недоступности модуля, недостатке прав или несовместимых параметрах sing-box пишет причину в лог и использует программную реализацию. WARP при этом сохраняет настройки обфускации. С `"system": false` (по умолчанию) сетевой стек работает в памяти sing-box через gVisor. С `"system": true` sing-box создаёт системный TUN и использует сокеты ОС. В обоих случаях WireGuard шифрует пакеты в процессе sing-box.
-
-Для WireGuard, AmneziaWG и WARP fallback включается, например, при `detour`, `bind_interface` или `auto_detect_interface` без марки auto-redirect. Для WireGuard и AmneziaWG то же относится к ненулевым `reserved`. Для Phobos внешний UDP обслуживает встроенный обфускатор, поэтому `detour` и привязка внешнего сокета доступны. Когда sing-box сам разрешает домен peer и получает несколько разных IP, он использует userspace, где есть перебор адресов. Единственный IP передаётся ядру при запуске.
-
-Если домен пира из профиля WARP возвращает несколько адресов, укажите один доступный IP пира в поле `address` endpoint `warp`, чтобы использовать ядро. Например, `"address": "162.159.192.1"`. Порт по-прежнему берётся из профиля, если поле `port` не задано.
-
-При настройке ядерного интерфейса sing-box проверяет локальный IPv4-адрес туннеля. Если адрес уже занят в том же сетевом namespace, endpoint запускается через gVisor. С `"system": true` конфликт приводит к ошибке запуска, поскольку системный TUN использует тот же namespace.
-
-В режиме `kernel` входящие IP-пакеты обрабатывает Linux. Отдельная таблица маршрутизации применяется к сокетам, привязанным к VPN-интерфейсу, и к трафику с исходным IP этого интерфейса. Внешние пакеты WireGuard и AmneziaWG следуют системным маршрутам с учётом `routing_mark`. В правилах маршрутизации sing-box endpoint в режиме `kernel` обслуживает TCP и UDP. Для пересылки ICMP между endpoint’ами sing-box используйте userspace.
+- WireGuard, AmneziaWG и WARP переключаются на userspace, например при `detour` или `bind_interface`, а также при `auto_detect_interface` без марки auto-redirect. WireGuard и AmneziaWG также переключаются при ненулевом `reserved`. У Phobos внешний UDP-сокет обслуживает обфускатор, поэтому `detour` и привязка сокета доступны.
+- Если sing-box получает несколько IP для домена пира, он перебирает их в userspace. Чтобы запустить WARP в ядре в этом случае, укажите один доступный IP в `address`. Если `port` не задан, порт берётся из профиля.
+- Занятый локальный IPv4-адрес туннеля в том же сетевом пространстве имён приводит к переключению на gVisor. При `"system": true` такой конфликт прерывает запуск.
+- Ядро обрабатывает входящие IP-пакеты. Отдельная таблица маршрутов применяется к сокетам, привязанным к VPN-интерфейсу, и к трафику с его IP. Внешние пакеты WireGuard и AmneziaWG следуют системным маршрутам с учётом `routing_mark`. Для пересылки ICMP между endpoint’ами sing-box нужен userspace.
 
 ## Phobos
 
-Клиентский endpoint `phobos` подключается к WireGuard-пресетам Phobos. Нужна сборка с `with_wireguard` и `with_gvisor`. Обфускатор встроен; отдельный процесс не требуется.
+Клиент Phobos со встроенным обфускатором входит в сборки с `with_wireguard` и `with_gvisor`. Перенесите параметры WireGuard из профиля вручную. Для `address` и `port` пира используйте публичный адрес обфускатора из `target` секции `[instance]`. Поле `source-lport` можно пропустить.
 
 ```json
 {
-  "endpoints": [{
-    "type": "phobos",
-    "tag": "phobos-vpn",
-    "kernel": true,
-    "address": ["10.8.0.2/32"],
-    "private_key": "<WireGuard private key>",
-    "peers": [{
-      "address": "vpn.example.com",
-      "port": 51822,
-      "public_key": "<WireGuard server public key>",
-      "allowed_ips": ["0.0.0.0/0", "::/0"],
-      "persistent_keepalive_interval": 25
-    }],
-    "obfuscation": {
-      "key": "<preset XOR key>",
-      "masking": "STUN"
+  "endpoints": [
+    {
+      "type": "phobos",
+      "tag": "phobos-vpn",
+      "address": ["10.8.0.2/32"],
+      "private_key": "<WireGuard private key>",
+      "peers": [
+        {
+          "address": "vpn.example.com",
+          "port": 51822,
+          "public_key": "<WireGuard server public key>",
+          "allowed_ips": ["0.0.0.0/0", "::/0"],
+          "persistent_keepalive_interval": 25
+        }
+      ],
+      "obfuscation": {
+        "key": "<preset XOR key>",
+        "masking": "STUN"
+      }
     }
-  }]
+  ]
 }
 ```
 
-Из профиля Phobos перенесите `PrivateKey`, `Address`, `PublicKey`, `PresharedKey` (если есть), `AllowedIPs` и `PersistentKeepalive` в соответствующие поля WireGuard. Адрес и порт peer берутся из `target` секции `[instance]`: это публичный адрес обфускатора, а не локальный `Endpoint` WireGuard. `source-lport` не нужен. DNS и правила направления трафика задаются обычной конфигурацией sing-box.
+- `key` обязателен, от 1 до 255 байт без NUL. `masking` задаётся по пресету сервера. Доступны `STUN` (по умолчанию), `MEDIA`, `NONE` и `AUTO`. Клиент AUTO начинает без маскировки. Сервер AUTO распознаёт STUN, а для MEDIA нужен отдельный режим.
+- `max_dummy` соответствует `max-dummy` (0–1024, по умолчанию 4). `obfuscate_bytes` задаёт число первых байт для обработки и соответствует `obfuscate-bytes`. По умолчанию это 16 для MEDIA и 0 для остальных режимов. Явный 0 обрабатывает весь пакет и требует того же на сервере. В указанной ниже версии Phobos режим MEDIA заменяет 0 на 16.
+- Для MEDIA доступны `media_pt` (0–127), `media_ssrc` (uint32) и `media_clock` (0–1000 кадров/с). Ноль выбирает пресет для `media_pt` и `media_clock` и случайное значение для `media_ssrc`.
+- Настройки обфускации общие для всех пиров endpoint. `reserved` должен содержать только нули. MTU по умолчанию 1280.
 
-В `obfuscation` ключ `key` обязателен (1–255 байт без NUL). `masking` — `STUN` (по умолчанию), `MEDIA`, `NONE` или `AUTO`; значение должно соответствовать пресету сервера. Клиент AUTO начинает без внешней маскировки; сервер AUTO распознаёт STUN, но не MEDIA.
-
-`max_dummy` соответствует `max-dummy` (0–1024, по умолчанию 4). `obfuscate_bytes` соответствует `obfuscate-bytes`: число первых обрабатываемых байт; 0 означает весь пакет. По умолчанию это 16 для MEDIA и 0 для остальных режимов. Явный 0 сохраняется; на сервере также должна быть включена полная обработка. В зафиксированной версии upstream MEDIA принудительно заменяет 0 на 16.
-
-Поля MEDIA: `media_pt` (0–127; 0 выбирает пресет), `media_ssrc` (uint32; 0 выбирает случайный SSRC), `media_clock` (0–1000 кадров/с; 0 выбирает пресет). Они соответствуют `media-pt`, `media-ssrc`, `media-clock`. Настройки обфускации общие для всех peers endpoint. `reserved` с ненулевыми байтами не поддерживается. MTU по умолчанию — 1280; его можно задать явно.
-
-Совместимость основана на [Phobos commit 22aedef](https://github.com/Ground-Zerro/Phobos/tree/22aedefda053062dc58c036072d2da6e216d5a34/src/phobos-obfuscator). SOCKS5 через TCP, серверная сторона и автоматический импорт профилей не входят в эту поддержку.
-
-Для проверки с исходной реализацией соберите `transport/phobos/testdata/reference.c`, передав компилятору `-I` с каталогом обфускатора этой версии. Задайте `PHOBOS_REFERENCE` путём к результату, а `PHOBOS_OBFUSCATOR` — путём к собранному upstream `wg-obfuscator`, затем выполните:
+Поддерживается клиент WireGuard-пресетов [Phobos версии 22aedef](https://github.com/Ground-Zerro/Phobos/tree/22aedefda053062dc58c036072d2da6e216d5a34/src/phobos-obfuscator). Чтобы проверить совместимость, соберите `transport/phobos/testdata/reference.c` с `-I`, указывающим на каталог обфускатора этой версии. Укажите путь к собранному файлу в `PHOBOS_REFERENCE`, а к оригинальному `wg-obfuscator` в `PHOBOS_OBFUSCATOR`.
 
 ```sh
 go test -race -ldflags=-checklinkname=0 -tags with_wireguard,with_gvisor,badlinkname,with_utls ./transport/phobos ./transport/wireguard ./protocol/wireguard ./include
 ```
+
+## Лицензия
+
+[GPL-3.0-or-later](LICENSE). Изменённые зависимости лежат в [`third_party`](third_party).
