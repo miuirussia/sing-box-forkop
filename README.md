@@ -85,6 +85,26 @@ sing-box geodata export --kind geoip --file geoip.dat --tag ru --output ru.srs
 
 Такой пакет получает сборку `custom`. Forkop с ним работает и показывает на странице только то, что в нём есть.
 
+## Autodetect
+
+`experimental.clash_api.autodetect` сравнивает HTTPS-запросы через прямой и прокси-выход для недавних соединений с признаками сбоя. Результаты доступны в `GET /autodetect` с теми же настройками авторизации, что и у остальных методов Clash API.
+
+```json
+{
+  "experimental": {
+    "clash_api": {
+      "autodetect": {
+        "direct": "direct-out",
+        "proxy": "Main",
+        "ports": [443, 8443]
+      }
+    }
+  }
+}
+```
+
+`direct` и `proxy` — теги разных выходов из вашей конфигурации. `ports` принимает один порт или список портов от 1 до 65535; по умолчанию проверяется только 443. На каждом выбранном порту используется HTTPS с проверкой сертификата. Проверки сохраняют исходный порт и SNI домена; для нестандартного порта HTTP Host включает порт. Локальные адреса и соединения UDP не проверяются.
+
 ## Зависимости
 
 Исправленные зависимости лежат в [`third_party`](third_party). Это wireguard-go с AmneziaWG, gVisor, sing-openvpn и sing-vmess.

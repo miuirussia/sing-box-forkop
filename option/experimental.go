@@ -46,14 +46,15 @@ type ClashAPIOptions struct {
 }
 
 type AutodetectOptions struct {
-	Direct          string             `json:"direct" reference:"outbound"`
-	Proxy           string             `json:"proxy" reference:"outbound"`
-	Timeout         badoption.Duration `json:"timeout,omitempty"`
-	Confirmations   int                `json:"confirmations,omitempty"`
-	StallTimeout    badoption.Duration `json:"stall_timeout,omitempty"`
-	ResponseLimit   int                `json:"response_limit,omitempty"`
-	RecheckInterval badoption.Duration `json:"recheck_interval,omitempty"`
-	HistoryLimit    int                `json:"history_limit,omitempty"`
+	Direct          string                     `json:"direct" reference:"outbound"`
+	Proxy           string                     `json:"proxy" reference:"outbound"`
+	Ports           badoption.Listable[uint16] `json:"ports,omitempty"`
+	Timeout         badoption.Duration         `json:"timeout,omitempty"`
+	Confirmations   int                        `json:"confirmations,omitempty"`
+	StallTimeout    badoption.Duration         `json:"stall_timeout,omitempty"`
+	ResponseLimit   int                        `json:"response_limit,omitempty"`
+	RecheckInterval badoption.Duration         `json:"recheck_interval,omitempty"`
+	HistoryLimit    int                        `json:"history_limit,omitempty"`
 }
 
 type V2RayAPIOptions struct {

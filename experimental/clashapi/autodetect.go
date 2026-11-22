@@ -79,6 +79,12 @@ type autodetectProgress struct {
 }
 
 func newAutodetector(server *Server, options option.AutodetectOptions) (*autodetector, error) {
+	if len(options.Ports) == 0 {
+		options.Ports = []uint16{443}
+	}
+	if slices.Contains(options.Ports, 0) {
+		return nil, fmt.Errorf("autodetect: ports must be between 1 and 65535")
+	}
 	for _, field := range []struct {
 		name                   string
 		value                  *badoption.Duration
@@ -189,7 +195,7 @@ func (a *autodetector) step(ctx context.Context, now time.Time) {
 		return right.CreatedAt.Compare(left.CreatedAt)
 	})
 	for _, connection := range connections {
-		domain := autodetectCandidate(connection, a.options.Direct, now)
+		domain := a.candidate(connection, now)
 		if domain == "" {
 			continue
 		}
@@ -252,9 +258,10 @@ func (a *autodetector) step(ctx context.Context, now time.Time) {
 	}
 }
 
-func autodetectCandidate(connection *trafficcontrol.TrackerMetadata, direct string, now time.Time) string {
+func (a *autodetector) candidate(connection *trafficcontrol.TrackerMetadata, now time.Time) string {
 	metadata := connection.Metadata
-	if metadata.Network != N.NetworkTCP || metadata.Destination.Port != 443 || !slices.Contains(connection.Chain, direct) ||
+	if metadata.Network != N.NetworkTCP || !slices.Contains(a.options.Ports, metadata.Destination.Port) ||
+		!slices.Contains(connection.Chain, a.options.Direct) ||
 		now.Sub(connection.CreatedAt) > autodetectCandidateMaxAge ||
 		(connection.ClosedAt.IsZero() && now.Sub(connection.CreatedAt) < 3*time.Second) {
 		return ""
@@ -360,7 +367,7 @@ func (a *autodetector) targets(ctx context.Context, connection *trafficcontrol.T
 		if !autodetectPublicAddress(address) {
 			return nil, nil
 		}
-		target := M.SocksaddrFrom(address.Unmap(), 443)
+		target := M.SocksaddrFrom(address.Unmap(), metadata.Destination.Port)
 		if !slices.Contains(targets, target) {
 			targets = append(targets, target)
 		}
@@ -433,7 +440,11 @@ func (a *autodetector) probe(ctx context.Context, domain string, target M.Socksa
 			}
 		},
 	})
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+domain+"/", nil)
+	authority := domain
+	if target.Port != 443 {
+		authority = net.JoinHostPort(domain, strconv.Itoa(int(target.Port)))
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+authority+"/", nil)
 	if err != nil {
 		return autodetectProbe{Stage: "http", Error: err.Error()}
 	}

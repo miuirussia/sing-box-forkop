@@ -167,8 +167,8 @@ func TestProbeAutodetectChecksSNIAndBoundedBody(t *testing.T) {
 	var requests atomic.Int32
 	site := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
-		if r.Method != "GET" || r.TLS.ServerName != "example.com" || r.Header.Get("Range") != "bytes=0-65535" {
-			t.Errorf("unexpected request: %s SNI=%s Range=%s", r.Method, r.TLS.ServerName, r.Header.Get("Range"))
+		if r.Method != "GET" || r.Host != "example.com" || r.TLS.ServerName != "example.com" || r.Header.Get("Range") != "bytes=0-65535" {
+			t.Errorf("unexpected request: %s Host=%s SNI=%s Range=%s", r.Method, r.Host, r.TLS.ServerName, r.Header.Get("Range"))
 		}
 		w.Write(make([]byte, 128*1024))
 	}))
@@ -300,12 +300,13 @@ func TestAutodetectDoesNotConfirmTransientFailure(t *testing.T) {
 
 func TestAutodetectCandidateSkipsOtherRoutesAndProtocols(t *testing.T) {
 	t.Parallel()
+	detector := newTestAutodetector(t, nil, option.AutodetectOptions{Direct: "direct-out"})
 	now := time.Now()
 	base := trafficcontrol.TrackerMetadata{
 		CreatedAt: now.Add(-time.Minute), Chain: []string{"direct-out"}, Download: new(atomic.Int64),
 		Metadata: adapter.InboundContext{Network: "tcp", Destination: M.ParseSocksaddr("openwrt.org:443")},
 	}
-	if autodetectCandidate(&base, "direct-out", now) != "openwrt.org" {
+	if detector.candidate(&base, now) != "openwrt.org" {
 		t.Fatal("missed HTTPS domain")
 	}
 	for _, test := range []struct {
@@ -314,6 +315,7 @@ func TestAutodetectCandidateSkipsOtherRoutesAndProtocols(t *testing.T) {
 	}{
 		{"VPN", func(c *trafficcontrol.TrackerMetadata) { c.Chain = []string{"vpn"} }},
 		{"QUIC", func(c *trafficcontrol.TrackerMetadata) { c.Metadata.Network = "udp" }},
+		{"unconfigured HTTPS port", func(c *trafficcontrol.TrackerMetadata) { c.Metadata.Destination.Port = 8443 }},
 		{"local IP", func(c *trafficcontrol.TrackerMetadata) { c.Metadata.Destination = M.ParseSocksaddr("192.168.1.1:443") }},
 		{"resolved local IP", func(c *trafficcontrol.TrackerMetadata) {
 			c.Metadata.DestinationAddresses = []netip.Addr{netip.MustParseAddr("192.168.1.1")}
@@ -327,7 +329,7 @@ func TestAutodetectCandidateSkipsOtherRoutesAndProtocols(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			connection := base
 			test.change(&connection)
-			if autodetectCandidate(&connection, "direct-out", now) != "" {
+			if detector.candidate(&connection, now) != "" {
 				t.Fatal("accepted excluded connection")
 			}
 		})
@@ -373,12 +375,53 @@ func TestAutodetectRejectsInvalidLimits(t *testing.T) {
 		{"body limit", option.AutodetectOptions{ResponseLimit: 1023}},
 		{"recheck interval", option.AutodetectOptions{RecheckInterval: badoption.Duration(59 * time.Second)}},
 		{"history limit", option.AutodetectOptions{HistoryLimit: 101}},
+		{"zero port", option.AutodetectOptions{Ports: []uint16{0, 443}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if _, err := newAutodetector(nil, test.options); err == nil {
 				t.Fatal("accepted an unsafe limit")
 			}
 		})
+	}
+}
+
+func TestAutodetectChecksConfiguredHTTPSPort(t *testing.T) {
+	t.Parallel()
+	site := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "example.com:8443" || r.TLS.ServerName != "example.com" {
+			t.Errorf("incorrect HTTPS authority: Host=%s SNI=%s", r.Host, r.TLS.ServerName)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer site.Close()
+	direct := newAutodetectOutbound("direct-out", "", true)
+	proxy := newAutodetectOutbound("Main", site.Listener.Addr().String(), false)
+	server := &Server{
+		outbound:       &linkAPIOutboundManager{outbounds: []adapter.Outbound{direct, proxy}},
+		trafficManager: trafficcontrol.NewManager(),
+	}
+	addAutodetectTestConnection(t, server, direct, adapter.InboundContext{
+		Domain: "example.com", Destination: M.ParseSocksaddr("203.0.113.1:8443"),
+	})
+	detector := newTestAutodetector(t, server, option.AutodetectOptions{
+		Direct: "direct-out", Proxy: "Main", Ports: []uint16{8443},
+	})
+	detector.step(autodetectTestContext(site), time.Now())
+	if len(detector.snapshot.Results) != 1 {
+		t.Fatalf("configured port was not checked: %+v", detector.snapshot)
+	}
+	result := detector.snapshot.Results[0]
+	if result.Verdict != "blocked" || result.Target != "203.0.113.1:8443" ||
+		direct.destination.Port != 8443 || proxy.destination.Port != 8443 ||
+		direct.calls.Load() != 2 || proxy.calls.Load() != 2 {
+		t.Fatalf("incorrect port or confirmation: %+v; calls=%d/%d", result, direct.calls.Load(), proxy.calls.Load())
+	}
+	addAutodetectTestConnection(t, server, direct, adapter.InboundContext{
+		Domain: "example.com", Destination: M.ParseSocksaddr("203.0.113.1:443"),
+	})
+	detector.step(autodetectTestContext(site), time.Now())
+	if direct.calls.Load() != 2 || proxy.calls.Load() != 2 {
+		t.Fatal("checked port 443 even though only 8443 was configured")
 	}
 }
 
@@ -398,6 +441,40 @@ func TestAutodetectUsesConfiguredResponseLimit(t *testing.T) {
 	result := detector.probe(autodetectTestContext(site), "example.com", M.ParseSocksaddr("example.com:443"), outbound)
 	if result.Error != "" || result.Status != 200 {
 		t.Fatalf("read past the configured limit: %+v", result)
+	}
+}
+
+func TestAutodetectPreservesConfiguredPortsForResolvedTargets(t *testing.T) {
+	t.Parallel()
+	address := netip.MustParseAddr("203.0.113.1")
+	server := &Server{dnsRouter: &autodetectDNSRouter{addresses: []netip.Addr{address}}}
+	detector := newTestAutodetector(t, server, option.AutodetectOptions{
+		Direct: "direct", Ports: []uint16{443, 8443, 65535},
+	})
+	for _, port := range detector.options.Ports {
+		for _, source := range []string{"observed IP", "resolved addresses", "DNS lookup"} {
+			t.Run(fmt.Sprintf("%s/%d", source, port), func(t *testing.T) {
+				metadata := adapter.InboundContext{
+					Network: "tcp", Domain: "example.com", Destination: M.Socksaddr{Fqdn: "example.com", Port: port},
+				}
+				switch source {
+				case "observed IP":
+					metadata.Destination = M.SocksaddrFrom(address, port)
+				case "resolved addresses":
+					metadata.DestinationAddresses = []netip.Addr{address, address}
+				}
+				connection := &trafficcontrol.TrackerMetadata{
+					Metadata: metadata, Chain: []string{"direct"}, CreatedAt: time.Now().Add(-time.Minute),
+				}
+				if detector.candidate(connection, time.Now()) != "example.com" {
+					t.Fatal("configured port was not accepted")
+				}
+				targets, err := detector.targets(context.Background(), connection, "example.com")
+				if err != nil || len(targets) != 1 || targets[0] != M.SocksaddrFrom(address, port) {
+					t.Fatalf("incorrect resolved target: %v, error: %v", targets, err)
+				}
+			})
+		}
 	}
 }
 
