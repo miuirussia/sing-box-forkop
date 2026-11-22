@@ -4,6 +4,7 @@ import "github.com/sagernet/sing/common/json/badoption"
 
 type WARPEndpointOptions struct {
 	System                      bool               `json:"system,omitempty"`
+	Kernel                      bool               `json:"kernel,omitempty"`
 	Name                        string             `json:"name,omitempty"`
 	ListenPort                  uint16             `json:"listen_port,omitempty"`
 	UDPTimeout                  badoption.Duration `json:"udp_timeout,omitempty"`

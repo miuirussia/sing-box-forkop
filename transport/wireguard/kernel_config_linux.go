@@ -277,9 +277,18 @@ func packKernelRange16(value *option.Range[uint32]) (uint32, error) {
 }
 
 func (c kernelConfig) amneziaAttributes(options *AmneziaOptions) ([]*nl.RtAttr, error) {
+	junkMin, junkMax := options.JMin, options.JMax
+	if options.JC > 0 {
+		// Userspace treats omitted bounds as zero and accepts them in either order.
+		junkMin, junkMax = max(junkMin, 0), max(junkMax, 0)
+		junkMin, junkMax = min(junkMin, junkMax), max(junkMin, junkMax)
+		if junkMax == 0 {
+			return nil, fmt.Errorf("%w: AmneziaWG kernel module skips zero-length junk packets", errKernelUnavailable)
+		}
+	}
 	var attrs []*nl.RtAttr
 	for _, field := range []struct{ id, value int }{
-		{kernelJc, options.JC}, {kernelJmin, options.JMin}, {kernelJmax, options.JMax},
+		{kernelJc, options.JC}, {kernelJmin, junkMin}, {kernelJmax, junkMax},
 		{kernelS1, options.S1}, {kernelS2, options.S2}, {kernelS3, options.S3}, {kernelS4, options.S4},
 	} {
 		if field.value > math.MaxUint16 {

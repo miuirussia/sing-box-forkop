@@ -30,6 +30,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/pause"
+	"github.com/vishvananda/netns"
 
 	"golang.org/x/sys/unix"
 )
@@ -80,7 +81,7 @@ func TestKernelWireGuardFallback(t *testing.T) {
 
 func TestKernelWireGuardTunnel(t *testing.T) {
 	if os.Getenv("SING_BOX_TEST_KERNEL_WIREGUARD") == "" {
-		t.Skip("set SING_BOX_TEST_KERNEL_WIREGUARD inside a Linux network namespace with CAP_NET_ADMIN")
+		t.Skip("set SING_BOX_TEST_KERNEL_WIREGUARD inside a Linux network namespace with CAP_NET_ADMIN and CAP_SYS_ADMIN")
 	}
 	obfuscation, err := phobos.Normalize(&option.PhobosObfuscationOptions{Key: "test", Masking: "STUN"})
 	if err != nil {
@@ -101,14 +102,16 @@ func TestKernelWireGuardTunnel(t *testing.T) {
 	amnezia31.RandomTrailers = true
 	amnezia31.DisableCookies = true
 	for _, test := range []struct {
-		name     string
-		kind     string
-		phobos   *phobos.Options
-		amnezia  *AmneziaOptions
-		detour   bool
-		multiDNS bool
+		name             string
+		kind             string
+		phobos           *phobos.Options
+		amnezia          *AmneziaOptions
+		detour           bool
+		multiDNS         bool
+		duplicateAddress bool
 	}{
 		{name: "wireguard", kind: C.TypeWireGuard},
+		{name: "wireguard duplicate IPv4 address", kind: C.TypeWireGuard, duplicateAddress: true},
 		{name: "amneziawg", kind: C.TypeAmneziaWG, amnezia: amnezia},
 		{name: "amneziawg 3.1", kind: C.TypeAmneziaWG, amnezia: &amnezia31},
 		{name: "phobos", kind: C.TypePhobos, phobos: obfuscation},
@@ -168,7 +171,34 @@ func TestKernelWireGuardTunnel(t *testing.T) {
 				clientOptions.DialerOptions.Detour = "proxy"
 				clientOptions.ResolvePeer = nil
 			}
+			if test.duplicateAddress {
+				firstOptions := clientOptions
+				firstOptions.Name = "wg-first"
+				firstOptions.PrivateKey, _ = testKeyPair(t)
+				firstOptions.Address = []netip.Prefix{clientAddresses[0]}
+				first := startTestEndpoint(t, firstOptions, true)
+				if !first.UsesKernel() {
+					t.Fatal("expected the first endpoint to use the kernel")
+				}
+				systemOptions := clientOptions
+				systemOptions.System = true
+				system, err := NewEndpoint(systemOptions)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = system.Close() })
+				if err = system.Start(true); err == nil || errors.Is(err, errKernelUnavailable) {
+					t.Fatalf("expected an error for an IPv4 address conflict in system mode, got %v", err)
+				}
+			}
 			client := startTestEndpoint(t, clientOptions, true)
+			if test.duplicateAddress {
+				if client.UsesKernel() {
+					t.Fatal("expected userspace fallback for a duplicate IPv4 address")
+				}
+				testKernelEcho(t, client, server.tunDevice.(*stackDevice), serverAddresses[0].Addr())
+				return
+			}
 			if test.multiDNS {
 				if client.UsesKernel() {
 					t.Fatal("expected userspace fallback with multiple distinct peer addresses")
@@ -198,6 +228,9 @@ func TestKernelWireGuardTunnel(t *testing.T) {
 				t.Fatal(err)
 			}
 			device := client.kernelDevice.(*linuxKernelDevice)
+			if test.phobos != nil {
+				testKernelPhobosSocketNamespace(t, device.relay)
+			}
 			if slices.ContainsFunc(routes, func(route netlink.Route) bool { return route.LinkIndex == device.link.Attrs().Index }) {
 				t.Fatal("kernel WireGuard interface added routes to the main table")
 			}
@@ -216,6 +249,46 @@ func TestKernelWireGuardTunnel(t *testing.T) {
 				t.Fatal("kernel WireGuard policy rule still exists after close")
 			}
 		})
+	}
+}
+
+func testKernelPhobosSocketNamespace(t *testing.T, relay *kernelPhobosRelay) {
+	t.Helper()
+	outerNamespace, err := netns.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outerNamespace.Close()
+	processNamespace, err := netns.GetFromPath("/proc/self/ns/net")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer processNamespace.Close()
+	if !processNamespace.Equal(outerNamespace) {
+		t.Fatal("Phobos setup moved the process main thread to a different network namespace")
+	}
+	for _, peer := range relay.peers {
+		rawConn, err := peer.local.SyscallConn()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var namespaceFD int
+		err = control.Raw(rawConn, func(fd uintptr) error {
+			var ioctlErr error
+			namespaceFD, ioctlErr = unix.IoctlRetInt(int(fd), unix.SIOCGSKNS)
+			return ioctlErr
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		innerNamespace := netns.NsHandle(namespaceFD)
+		sharedNamespace := innerNamespace.Equal(outerNamespace)
+		if err = innerNamespace.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if sharedNamespace {
+			t.Fatal("Phobos loopback socket is in the outer network namespace")
+		}
 	}
 }
 

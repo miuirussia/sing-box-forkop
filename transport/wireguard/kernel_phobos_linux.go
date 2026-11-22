@@ -8,10 +8,16 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
+	"github.com/sagernet/netlink"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/wireguard-go/conn"
+	"github.com/vishvananda/netns"
+
+	"golang.org/x/sys/unix"
 )
 
 type kernelPhobosRelay struct {
@@ -29,9 +35,9 @@ type kernelPhobosPeer struct {
 	remote conn.Endpoint
 }
 
-func newKernelPhobosRelay(endpoint *Endpoint) (_ *kernelPhobosRelay, _ []peerConfig, err error) {
+func newKernelPhobosRelay(endpoint *Endpoint) (_ *kernelPhobosRelay, _ []peerConfig, _ netlink.Link, err error) {
 	if endpoint.options.Phobos == nil || len(endpoint.peers) == 0 {
-		return nil, nil, fmt.Errorf("%w: Phobos relay requires obfuscation and at least one peer", errKernelUnavailable)
+		return nil, nil, nil, fmt.Errorf("%w: Phobos relay requires obfuscation and at least one peer", errKernelUnavailable)
 	}
 	bind, connectDomain := endpoint.createBind()
 	relay := &kernelPhobosRelay{
@@ -52,9 +58,10 @@ func newKernelPhobosRelay(endpoint *Endpoint) (_ *kernelPhobosRelay, _ []peerCon
 	} else {
 		peers, err = resolveKernelPeers(endpoint)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
+	paths := make([]*kernelPhobosPeer, len(peers))
 	for i, peer := range peers {
 		var remote string
 		switch {
@@ -63,30 +70,92 @@ func newKernelPhobosRelay(endpoint *Endpoint) (_ *kernelPhobosRelay, _ []peerCon
 		case connectDomain:
 			remote = peer.destination.String()
 		default:
-			return nil, nil, fmt.Errorf("%w: Phobos peer %d has no endpoint address", errKernelUnavailable, i)
+			return nil, nil, nil, fmt.Errorf("%w: Phobos peer %d has no endpoint address", errKernelUnavailable, i)
 		}
 		path := relay.peers[remote]
 		if path == nil {
 			remoteEndpoint, err := bind.ParseEndpoint(remote)
 			if err != nil {
-				return nil, nil, fmt.Errorf("parse Phobos peer %d: %w", i, err)
+				return nil, nil, nil, fmt.Errorf("parse Phobos peer %d: %w", i, err)
 			}
-			local, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-			if err != nil {
-				return nil, nil, kernelSetupError("listen on Phobos loopback socket", err)
-			}
-			path = &kernelPhobosPeer{local: local, remote: remoteEndpoint}
+			path = &kernelPhobosPeer{remote: remoteEndpoint}
 			relay.peers[remote] = path
 		}
-		// Each outer address has a stable loopback endpoint. WireGuard demultiplexes
-		// peers sharing an address by their public keys.
-		peers[i].endpoint = path.local.LocalAddr().(*net.UDPAddr).AddrPort()
+		paths[i] = path
 	}
 	relay.receive, relay.listenPort, err = bind.Open(endpoint.options.ListenPort)
 	if err != nil {
-		return nil, nil, kernelSetupError("open Phobos outer UDP bind", err)
+		return nil, nil, nil, kernelSetupError("open Phobos outer UDP bind", err)
 	}
-	return relay, peers, nil
+	link, err := createKernelLink(endpoint.options.Name, C.TypeWireGuard, endpoint.options.MTU, relay.addKernelLink)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	// Each outer address has a stable loopback endpoint. WireGuard demultiplexes
+	// peers sharing an address by their public keys.
+	for i, path := range paths {
+		peers[i].endpoint = path.local.LocalAddr().(*net.UDPAddr).AddrPort()
+	}
+	return relay, peers, link, nil
+}
+
+func (r *kernelPhobosRelay) addKernelLink(link netlink.Link) error {
+	outerNamespace, err := netns.Get()
+	if err != nil {
+		return fmt.Errorf("open current network namespace: %w", err)
+	}
+	defer outerNamespace.Close()
+	result := make(chan error)
+	setup := func() {
+		result <- r.addKernelLinkInNamespace(link, outerNamespace)
+	}
+	go func() {
+		runtime.LockOSThread()
+		if unix.Gettid() == os.Getpid() {
+			// The runtime cannot discard the main thread. Keep it occupied
+			// until another thread has been locked for the namespace setup.
+			defer runtime.UnlockOSThread()
+			workerReady := make(chan struct{})
+			go func() {
+				runtime.LockOSThread()
+				close(workerReady)
+				setup()
+			}()
+			<-workerReady
+			return
+		}
+		setup()
+	}()
+	return <-result
+}
+
+func (r *kernelPhobosRelay) addKernelLinkInNamespace(link netlink.Link, outerNamespace netns.NsHandle) error {
+	if err := unix.Unshare(unix.CLONE_NEWNET); err != nil {
+		return fmt.Errorf("%w: create private Phobos network namespace: %w", errKernelUnavailable, err)
+	}
+	loopback, err := netlink.LinkByName("lo")
+	if err != nil {
+		return fmt.Errorf("find Phobos loopback interface: %w", err)
+	}
+	if err = netlink.LinkSetUp(loopback); err != nil {
+		return fmt.Errorf("bring up Phobos loopback interface: %w", err)
+	}
+	for _, peer := range r.peers {
+		peer.local, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			return fmt.Errorf("listen on Phobos loopback socket: %w", err)
+		}
+	}
+	// WireGuard keeps its UDP sockets in the namespace where its link was
+	// created. The relay's loopback sockets keep that namespace alive.
+	if err = netlink.LinkAdd(link); err != nil {
+		return err
+	}
+	if err = netlink.LinkSetNsFd(link, int(outerNamespace)); err != nil {
+		return fmt.Errorf("move Phobos interface to the outer network namespace: %w", err)
+	}
+	link.Attrs().Index = 0
+	return nil
 }
 
 func (r *kernelPhobosRelay) start(port uint16) {
@@ -183,7 +252,9 @@ func (r *kernelPhobosRelay) receivePackets(receive conn.ReceiveFunc, kernelAddre
 func (r *kernelPhobosRelay) Close() error {
 	var errs []error
 	for _, peer := range r.peers {
-		errs = append(errs, peer.local.Close())
+		if peer.local != nil {
+			errs = append(errs, peer.local.Close())
+		}
 	}
 	r.endpoint.closeEgressPool()
 	errs = append(errs, r.bind.Close())

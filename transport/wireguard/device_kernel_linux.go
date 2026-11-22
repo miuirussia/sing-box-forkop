@@ -72,11 +72,20 @@ func startKernelDevice(endpoint *Endpoint) (_ kernelDevice, err error) {
 		}
 	}
 
-	link, err := createKernelLink(options.Name, linkKind, options.MTU)
-	if err != nil {
-		return nil, kernelSetupError("create "+kind+" interface", err)
+	var (
+		link  netlink.Link
+		relay *kernelPhobosRelay
+		peers []peerConfig
+	)
+	if kind == C.TypePhobos {
+		relay, peers, link, err = newKernelPhobosRelay(endpoint)
+	} else {
+		link, err = createKernelLink(options.Name, linkKind, options.MTU, netlink.LinkAdd)
 	}
-	device := &linuxKernelDevice{link: link}
+	if err != nil {
+		return nil, err
+	}
+	device := &linuxKernelDevice{link: link, relay: relay}
 	defer func() {
 		if err != nil {
 			if closeErr := device.Close(); closeErr != nil {
@@ -90,30 +99,22 @@ func startKernelDevice(endpoint *Endpoint) (_ kernelDevice, err error) {
 	}
 	config := kernelConfig{family: family, index: link.Attrs().Index, amnezia: kind == C.TypeAmneziaWG}
 	listenPort := options.ListenPort
-	var peers []peerConfig
-	if kind == C.TypePhobos {
-		device.relay, peers, err = newKernelPhobosRelay(endpoint)
+	if relay != nil {
 		listenPort = 0
 	} else {
 		peers, err = resolveKernelPeers(endpoint)
-	}
-	if err != nil {
-		return nil, err
+		if err != nil {
+			return nil, err
+		}
 	}
 	err = config.apply(endpoint, mark, listenPort, peers)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, address := range options.Address {
-		flags := unix.IFA_F_NOPREFIXROUTE
-		if address.Addr().Is6() {
-			flags |= unix.IFA_F_NODAD
-		}
-		err = netlink.AddrAdd(link, &netlink.Addr{IPNet: prefixIPNet(address), Flags: flags})
-		if err != nil {
-			return nil, kernelSetupError("add kernel WireGuard interface address", err)
-		}
+	err = device.addAddresses(options.Address, options.System)
+	if err != nil {
+		return nil, err
 	}
 	err = device.SetUp(true)
 	if err != nil {
@@ -180,7 +181,7 @@ func kernelRoutingMark(options EndpointOptions) (uint32, error) {
 	return mark, nil
 }
 
-func createKernelLink(name, kind string, mtu uint32) (netlink.Link, error) {
+func createKernelLink(name, kind string, mtu uint32, add func(netlink.Link) error) (netlink.Link, error) {
 	kernelSetupAccess.Lock()
 	defer kernelSetupAccess.Unlock()
 	if name == "" {
@@ -194,14 +195,55 @@ func createKernelLink(name, kind string, mtu uint32) (netlink.Link, error) {
 	attrs.Name = name
 	attrs.MTU = int(mtu)
 	link := &netlink.GenericLink{LinkAttrs: attrs, LinkType: kind}
-	err := netlink.LinkAdd(link)
+	err := add(link)
 	if err != nil {
-		return nil, err
+		return nil, kernelSetupError("create "+kind+" interface", err)
 	}
 	if link.Index == 0 {
-		return nil, errors.Join(fmt.Errorf("find newly created interface %q", name), netlink.LinkDel(link))
+		movedLink, err := netlink.LinkByName(name)
+		if err != nil {
+			return nil, errors.Join(fmt.Errorf("find newly created interface %q: %w", name, err), netlink.LinkDel(link))
+		}
+		return movedLink, nil
 	}
 	return link, nil
+}
+
+func (d *linuxKernelDevice) addAddresses(addresses []netip.Prefix, system bool) error {
+	kernelSetupAccess.Lock()
+	defer kernelSetupAccess.Unlock()
+
+	if slices.ContainsFunc(addresses, func(address netip.Prefix) bool { return address.Addr().Is4() }) {
+		assigned, err := netlink.AddrList(nil, unix.AF_INET)
+		if err != nil {
+			return kernelSetupError("list local IPv4 addresses", err)
+		}
+		// The source routing rule cannot distinguish tunnels with the same IPv4 address.
+		for _, address := range addresses {
+			if !address.Addr().Is4() {
+				continue
+			}
+			ip := net.IP(address.Addr().AsSlice())
+			if !slices.ContainsFunc(assigned, func(existing netlink.Addr) bool { return existing.IP.Equal(ip) }) {
+				continue
+			}
+			if system {
+				return fmt.Errorf("system mode requires a unique local IPv4 address: %s is already assigned", ip)
+			}
+			return fmt.Errorf("%w: local IPv4 address %s is already assigned", errKernelUnavailable, ip)
+		}
+	}
+	for _, address := range addresses {
+		flags := unix.IFA_F_NOPREFIXROUTE
+		if address.Addr().Is6() {
+			flags |= unix.IFA_F_NODAD
+		}
+		err := netlink.AddrAdd(d.link, &netlink.Addr{IPNet: prefixIPNet(address), Flags: flags})
+		if err != nil {
+			return kernelSetupError("add kernel WireGuard interface address", err)
+		}
+	}
+	return nil
 }
 
 func (d *linuxKernelDevice) addRoutes(addresses, allowed []netip.Prefix) error {
@@ -357,6 +399,8 @@ func (d *linuxKernelDevice) Close() error {
 
 func kernelSetupError(action string, err error) error {
 	switch {
+	case errors.Is(err, errKernelUnavailable):
+		return fmt.Errorf("%s: %w", action, err)
 	case errors.Is(err, unix.EOPNOTSUPP), errors.Is(err, unix.EPROTONOSUPPORT), errors.Is(err, unix.EAFNOSUPPORT),
 		errors.Is(err, unix.ENOENT), errors.Is(err, unix.ENODEV), errors.Is(err, unix.ENOSYS),
 		errors.Is(err, unix.EPERM), errors.Is(err, unix.EACCES):

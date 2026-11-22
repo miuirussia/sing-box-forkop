@@ -132,44 +132,58 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		if options.Port != 0 {
 			peerPort = options.Port
 		}
-		wireguardEndpoint, err := wireguard.NewEndpoint(
-			ctx,
-			router,
-			logger,
-			tag,
-			option.WireGuardEndpointOptions{
-				// Cloudflare answers plain WireGuard, so the WARP endpoint carries
-				// the same one-sided obfuscation class and passes it straight on.
-				Amnezia: options.Amnezia,
-				WireGuardCommonOptions: option.WireGuardCommonOptions{
-					System:        options.System,
-					Name:          options.Name,
-					ListenPort:    options.ListenPort,
-					UDPTimeout:    options.UDPTimeout,
-					Workers:       options.Workers,
-					DialerOptions: options.DialerOptions,
-
-					Address: badoption.Listable[netip.Prefix]{
-						netip.MustParsePrefix(config.Interface.Addresses.V4 + "/32"),
-						netip.MustParsePrefix(config.Interface.Addresses.V6 + "/128"),
+		wireguardOptions := option.WireGuardCommonOptions{
+			System:        options.System,
+			Kernel:        options.Kernel,
+			Name:          options.Name,
+			ListenPort:    options.ListenPort,
+			UDPTimeout:    options.UDPTimeout,
+			Workers:       options.Workers,
+			DialerOptions: options.DialerOptions,
+			Address: badoption.Listable[netip.Prefix]{
+				netip.MustParsePrefix(config.Interface.Addresses.V4 + "/32"),
+				netip.MustParsePrefix(config.Interface.Addresses.V6 + "/128"),
+			},
+			PrivateKey: config.PrivateKey,
+			Peers: []option.WireGuardPeer{
+				{
+					Address:   peerAddress,
+					Port:      peerPort,
+					PublicKey: peer.PublicKey,
+					AllowedIPs: badoption.Listable[netip.Prefix]{
+						netip.MustParsePrefix("0.0.0.0/0"),
+						netip.MustParsePrefix("::/0"),
 					},
-					PrivateKey: config.PrivateKey,
-					Peers: []option.WireGuardPeer{
-						{
-							Address:   peerAddress,
-							Port:      peerPort,
-							PublicKey: peer.PublicKey,
-							AllowedIPs: badoption.Listable[netip.Prefix]{
-								netip.MustParsePrefix("0.0.0.0/0"),
-								netip.MustParsePrefix("::/0"),
-							},
-							PersistentKeepaliveInterval: options.PersistentKeepaliveInterval,
-						},
-					},
-					MTU: 1280,
+					PersistentKeepaliveInterval: options.PersistentKeepaliveInterval,
 				},
 			},
-		)
+			MTU: 1280,
+		}
+		var wireguardEndpoint adapter.Endpoint
+		if options.Kernel && options.Amnezia != nil && *options.Amnezia != (option.OneSidedAmnezia{}) {
+			// Cloudflare speaks plain WireGuard, so keep the default headers and packet prefixes.
+			wireguardEndpoint, err = wireguard.NewAmneziaWGEndpoint(
+				ctx,
+				router,
+				logger,
+				tag,
+				option.AmneziaWGEndpointOptions{
+					WireGuardCommonOptions: wireguardOptions,
+					Amnezia:                &option.WireGuardAmnezia{OneSidedAmnezia: *options.Amnezia},
+				},
+			)
+		} else {
+			wireguardEndpoint, err = wireguard.NewEndpoint(
+				ctx,
+				router,
+				logger,
+				tag,
+				option.WireGuardEndpointOptions{
+					WireGuardCommonOptions: wireguardOptions,
+					Amnezia:                options.Amnezia,
+				},
+			)
+		}
 		if err != nil {
 			logger.ErrorContext(ctx, err)
 			return
