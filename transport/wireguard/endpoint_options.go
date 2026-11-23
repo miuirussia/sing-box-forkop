@@ -19,6 +19,7 @@ type EndpointOptions struct {
 	Logger        logger.ContextLogger
 	System        bool
 	KernelKind    string
+	KernelDetour  bool
 	DialerOptions option.DialerOptions
 	Handler       tun.Handler
 	UDPTimeout    time.Duration

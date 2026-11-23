@@ -29,7 +29,7 @@ var kernelSetupAccess sync.Mutex
 type linuxKernelDevice struct {
 	link     netlink.Link
 	rules    []*netlink.Rule
-	relay    *kernelPhobosRelay
+	relay    *kernelUDPRelay
 	dialer   net.Dialer
 	listener net.ListenConfig
 	closed   bool
@@ -48,10 +48,16 @@ func startKernelDevice(endpoint *Endpoint) (_ kernelDevice, err error) {
 		return nil, errKernelUnavailable
 	}
 	linkKind := kind
-	var mark uint32
+	useRelay := options.KernelDetour
 	if kind == C.TypePhobos {
+		if options.Phobos == nil {
+			return nil, fmt.Errorf("%w: Phobos relay requires obfuscation", errKernelUnavailable)
+		}
 		linkKind = C.TypeWireGuard
-	} else {
+		useRelay = true
+	}
+	var mark uint32
+	if !useRelay {
 		mark, err = kernelRoutingMark(options)
 		if err != nil {
 			return nil, err
@@ -74,11 +80,11 @@ func startKernelDevice(endpoint *Endpoint) (_ kernelDevice, err error) {
 
 	var (
 		link  netlink.Link
-		relay *kernelPhobosRelay
+		relay *kernelUDPRelay
 		peers []peerConfig
 	)
-	if kind == C.TypePhobos {
-		relay, peers, link, err = newKernelPhobosRelay(endpoint)
+	if useRelay {
+		relay, peers, link, err = newKernelUDPRelay(endpoint, linkKind)
 	} else {
 		link, err = createKernelLink(options.Name, linkKind, options.MTU, netlink.LinkAdd)
 	}
@@ -89,7 +95,7 @@ func startKernelDevice(endpoint *Endpoint) (_ kernelDevice, err error) {
 	defer func() {
 		if err != nil {
 			if closeErr := device.Close(); closeErr != nil {
-				err = fmt.Errorf("clean up %s after %v: %w", link.Attrs().Name, err, closeErr)
+				err = fmt.Errorf("clean up %s after %w: %w", link.Attrs().Name, err, closeErr)
 			}
 		}
 	}()
@@ -127,7 +133,7 @@ func startKernelDevice(endpoint *Endpoint) (_ kernelDevice, err error) {
 	if device.relay != nil {
 		port, err := config.listenPort()
 		if err != nil {
-			return nil, kernelSetupError("read Phobos kernel WireGuard listen port", err)
+			return nil, kernelSetupError("read kernel WireGuard relay port", err)
 		}
 		device.relay.start(port)
 	}

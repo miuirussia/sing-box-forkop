@@ -52,11 +52,27 @@ type Endpoint struct {
 }
 
 func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.WireGuardEndpointOptions) (adapter.Endpoint, error) {
-	return newEndpoint(ctx, router, logger, C.TypeWireGuard, tag, options.WireGuardCommonOptions, oneSidedAmneziaOptions(options.Amnezia))
+	return newEndpoint(ctx, router, logger, tag, deviceConfiguration{
+		Type: C.TypeWireGuard, Options: options.WireGuardCommonOptions, Amnezia: oneSidedAmneziaOptions(options.Amnezia),
+	})
 }
 
 func NewAmneziaWGEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.AmneziaWGEndpointOptions) (adapter.Endpoint, error) {
-	return newEndpoint(ctx, router, logger, C.TypeAmneziaWG, tag, options.WireGuardCommonOptions, amneziaOptions(options.Amnezia))
+	return newEndpoint(ctx, router, logger, tag, deviceConfiguration{
+		Type: C.TypeAmneziaWG, Options: options.WireGuardCommonOptions, Amnezia: amneziaOptions(options.Amnezia),
+	})
+}
+
+func NewWARPEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.WireGuardCommonOptions, amnezia *option.OneSidedAmnezia) (adapter.Endpoint, error) {
+	endpointType := C.TypeWireGuard
+	// Cloudflare uses plain WireGuard headers even with one-sided obfuscation.
+	if options.Kernel && amnezia != nil && *amnezia != (option.OneSidedAmnezia{}) {
+		endpointType = C.TypeAmneziaWG
+	}
+	return newEndpoint(ctx, router, logger, tag, deviceConfiguration{
+		Type: endpointType, Options: options, Amnezia: oneSidedAmneziaOptions(amnezia),
+		KernelDetour: options.Kernel && options.Detour != "",
+	})
 }
 
 func NewPhobosEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.PhobosEndpointOptions) (adapter.Endpoint, error) {
@@ -74,7 +90,9 @@ func NewPhobosEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 	if options.MTU == 0 {
 		options.MTU = 1280
 	}
-	return newEndpoint(ctx, router, logger, C.TypePhobos, tag, options.WireGuardCommonOptions, nil, obfuscation)
+	return newEndpoint(ctx, router, logger, tag, deviceConfiguration{
+		Type: C.TypePhobos, Options: options.WireGuardCommonOptions, Phobos: obfuscation,
+	})
 }
 
 // oneSidedAmneziaOptions maps the obfuscation a peer never has to know about.
@@ -120,12 +138,10 @@ func amneziaOptions(options *option.WireGuardAmnezia) *wireguard.AmneziaOptions 
 	return amnezia
 }
 
-func newEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, endpointType string, tag string, options option.WireGuardCommonOptions, amnezia *wireguard.AmneziaOptions, obfuscations ...*phobos.Options) (adapter.Endpoint, error) {
-	var obfuscation *phobos.Options
-	if len(obfuscations) > 0 {
-		obfuscation = obfuscations[0]
-	}
-	options.UDPFragmentDefault = true
+func newEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, config deviceConfiguration) (adapter.Endpoint, error) {
+	config.Options.UDPFragmentDefault = true
+	options := config.Options
+	endpointType := config.Type
 	ep := &Endpoint{
 		Adapter:        endpoint.NewAdapterWithDialerOptions(endpointType, tag, []string{N.NetworkTCP, N.NetworkUDP, N.NetworkICMP}, options.DialerOptions),
 		ctx:            ctx,
@@ -137,7 +153,7 @@ func newEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	if options.Detour != "" && options.ListenPort != 0 {
 		return nil, E.New("`listen_port` is conflict with `detour`")
 	}
-	configuration, identities, err := sharedDeviceKey(endpointType, options, amnezia, obfuscation)
+	configuration, identities, err := config.key()
 	if err != nil {
 		return nil, err
 	}
@@ -188,6 +204,7 @@ func newEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		Logger:          logger,
 		System:          options.System,
 		KernelKind:      kernelKind,
+		KernelDetour:    config.KernelDetour,
 		DialerOptions:   options.DialerOptions,
 		Handler:         device,
 		UDPTimeout:      udpTimeout,
@@ -234,8 +251,8 @@ func newEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 			}
 		}),
 		Workers: options.Workers,
-		Amnezia: amnezia,
-		Phobos:  obfuscation,
+		Amnezia: config.Amnezia,
+		Phobos:  config.Phobos,
 	})
 	if err != nil {
 		return nil, err

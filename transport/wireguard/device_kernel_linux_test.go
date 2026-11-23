@@ -314,7 +314,7 @@ func TestKernelWireGuardTunnel(t *testing.T) {
 	}
 }
 
-func testKernelPhobosSocketNamespace(t *testing.T, relay *kernelPhobosRelay) {
+func testKernelPhobosSocketNamespace(t *testing.T, relay *kernelUDPRelay) {
 	t.Helper()
 	outerNamespace, err := netns.Get()
 	if err != nil {

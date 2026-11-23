@@ -41,10 +41,11 @@ type deviceRegistry struct {
 }
 
 type deviceConfiguration struct {
-	Phobos  *phobos.Options               `json:"phobos,omitempty"`
-	Type    string                        `json:"type"`
-	Options option.WireGuardCommonOptions `json:"options"`
-	Amnezia *wireguard.AmneziaOptions     `json:"amnezia,omitempty"`
+	Phobos       *phobos.Options               `json:"phobos,omitempty"`
+	Type         string                        `json:"type"`
+	Options      option.WireGuardCommonOptions `json:"options"`
+	Amnezia      *wireguard.AmneziaOptions     `json:"amnezia,omitempty"`
+	KernelDetour bool                          `json:"kernel_detour,omitempty"`
 }
 
 var registryAccess sync.Mutex
@@ -63,18 +64,14 @@ func deviceRegistryFromContext(ctx context.Context) *deviceRegistry {
 	return registry
 }
 
-func sharedDeviceKey(endpointType string, options option.WireGuardCommonOptions, amnezia *wireguard.AmneziaOptions, obfuscations ...*phobos.Options) (string, []string, error) {
-	var obfuscation *phobos.Options
-	if len(obfuscations) > 0 {
-		obfuscation = obfuscations[0]
-	}
-	content, err := json.Marshal(deviceConfiguration{Type: endpointType, Options: options, Amnezia: amnezia, Phobos: obfuscation})
+func (c deviceConfiguration) key() (string, []string, error) {
+	content, err := json.Marshal(c)
 	if err != nil {
 		return "", nil, err
 	}
-	identities := make([]string, 0, len(options.Peers))
-	for _, peer := range options.Peers {
-		identities = append(identities, options.PrivateKey+"/"+peer.PublicKey)
+	identities := make([]string, 0, len(c.Options.Peers))
+	for _, peer := range c.Options.Peers {
+		identities = append(identities, c.Options.PrivateKey+"/"+peer.PublicKey)
 	}
 	return string(content), identities, nil
 }

@@ -72,12 +72,13 @@ sing-box geodata export --kind geoip --file geoip.dat --tag ru --output ru.srs
 
 ## WireGuard в ядре Linux
 
-Добавьте `"kernel": true` в endpoint `wireguard`, `amneziawg`, `phobos` или `warp`. Нужны `CAP_NET_ADMIN` и модуль `wireguard` либо `amneziawg`. WARP с обфускацией пробует `amneziawg`, обычный WARP использует `wireguard`. Phobos помещает внутренний UDP-порт WireGuard в отдельное сетевое пространство имён, для чего нужен `CAP_SYS_ADMIN`.
+Добавьте `"kernel": true` в endpoint `wireguard`, `amneziawg`, `phobos` или `warp`. Нужны `CAP_NET_ADMIN` и модуль `wireguard` либо `amneziawg`. WARP с обфускацией пробует `amneziawg`, обычный WARP использует `wireguard`.
 
 При недоступном модуле, нехватке прав или несовместимых настройках sing-box пишет причину в лог и переключается на userspace. Там туннель использует gVisor по умолчанию или системный TUN с `"system": true`. WARP сохраняет обфускацию при переключении.
 
-- WireGuard, AmneziaWG и WARP переключаются на userspace, например при `detour` или `bind_interface`, а также при `auto_detect_interface` без марки auto-redirect. WireGuard и AmneziaWG также переключаются при ненулевом `reserved`. У Phobos внешний UDP-сокет обслуживает обфускатор, поэтому `detour` и привязка сокета доступны.
-- Если sing-box получает несколько IP для домена пира, он перебирает их в userspace. Чтобы запустить WARP в ядре в этом случае, укажите один доступный IP в `address`. Если `port` не задан, порт берётся из профиля.
+- WARP в режиме Kernel поддерживает `detour` через outbound с UDP. Шифрование выполняет ядро, а sing-box передаёт зашифрованные пакеты через выбранный outbound. WARP с каскадом и Phobos используют отдельное сетевое пространство имён для внутреннего UDP-порта. Для его создания нужен `CAP_SYS_ADMIN`.
+- WireGuard и AmneziaWG переключаются на userspace при `detour` или ненулевом `reserved`. Для прямых подключений WireGuard, AmneziaWG и WARP переход также вызывают `bind_interface` и `auto_detect_interface` без марки auto-redirect. Phobos поддерживает `detour` и привязку внешнего UDP-сокета.
+- При прямом подключении ядро принимает один IP для домена пира. Если DNS возвращает несколько IP, укажите доступный IP в `address`. При каскаде WARP передаёт домен выбранному outbound, если в настройках WARP не указан `domain_resolver`. Если `port` не задан, порт берётся из профиля.
 - Занятый локальный IPv4-адрес туннеля в том же сетевом пространстве имён приводит к переключению на gVisor. При `"system": true` такой конфликт прерывает запуск.
 - Ядро обрабатывает входящие IP-пакеты. Отдельная таблица маршрутов применяется к сокетам, привязанным к VPN-интерфейсу, и к трафику с его IP. Внешние пакеты WireGuard и AmneziaWG следуют системным маршрутам с учётом `routing_mark`. Для пересылки ICMP между endpoint’ами sing-box нужен userspace.
 

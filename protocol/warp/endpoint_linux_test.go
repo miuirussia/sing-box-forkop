@@ -3,19 +3,23 @@
 package warp_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/sagernet/netlink"
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/cloudflare"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/cachefile"
@@ -25,13 +29,14 @@ import (
 	"github.com/sagernet/sing-box/protocol/warp"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/service"
 
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 func TestWARPLinuxBackends(t *testing.T) {
 	if os.Getenv("SING_BOX_TEST_KERNEL_WIREGUARD") == "" {
-		t.Skip("set SING_BOX_TEST_KERNEL_WIREGUARD inside a Linux network namespace with CAP_NET_ADMIN")
+		t.Skip("set SING_BOX_TEST_KERNEL_WIREGUARD inside a Linux network namespace with CAP_NET_ADMIN and CAP_SYS_ADMIN")
 	}
 	loopback, err := netlink.LinkByName("lo")
 	if err != nil {
@@ -60,16 +65,29 @@ func TestWARPLinuxBackends(t *testing.T) {
 		t.Fatal(err)
 	}
 	obfuscation := &option.OneSidedAmnezia{JC: 2, JMin: 40, JMax: 64}
+	fallbackObfuscation := &option.OneSidedAmnezia{JC: 2, I1: "<b 0xdeadbeef>"}
 	for _, test := range []struct {
-		name    string
-		kind    string
-		system  bool
-		detour  string
-		amnezia *option.OneSidedAmnezia
+		name           string
+		kind           string
+		detourHost     string
+		amnezia        *option.OneSidedAmnezia
+		system         bool
+		blackholeFirst bool
+		resolvePeer    bool
 	}{
 		{name: "plain kernel", kind: C.TypeWireGuard},
 		{name: "obfuscated kernel", kind: C.TypeAmneziaWG, amnezia: obfuscation},
-		{name: "system fallback through detour", kind: "tuntap", system: true, detour: "direct", amnezia: obfuscation},
+		{name: "plain kernel through detour by name", kind: C.TypeWireGuard, detourHost: "warp-peer.test"},
+		{name: "plain kernel through detour with domain resolver", kind: C.TypeWireGuard, detourHost: "192.0.2.2", resolvePeer: true},
+		{name: "obfuscated kernel through detour by IP", kind: C.TypeAmneziaWG, detourHost: "192.0.2.2", amnezia: obfuscation},
+		{
+			name: "obfuscated kernel reconnects a silent detour", kind: C.TypeAmneziaWG,
+			detourHost: "192.0.2.2", amnezia: obfuscation, blackholeFirst: true,
+		},
+		{
+			name: "obfuscated system fallback through detour", kind: "tuntap",
+			detourHost: "192.0.2.2", amnezia: fallbackObfuscation, system: true,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if test.kind == C.TypeAmneziaWG {
@@ -87,20 +105,50 @@ func TestWARPLinuxBackends(t *testing.T) {
 			udp.Close()
 			cacheOptions := option.CacheFileOptions{Enabled: true, Path: filepath.Join(t.TempDir(), "warp.db"), StoreWARPConfig: true}
 			seedWARPTestProfile(t, ctx, cacheOptions, clientKey, serverKey.PublicKey(), port)
+			warpOptions := &option.WARPEndpointOptions{Kernel: true, Name: "warp-test", Amnezia: test.amnezia, System: test.system}
+			firstPacket := make(chan []byte, 1)
+			outbounds := []option.Outbound{{Type: C.TypeDirect, Tag: "direct", Options: &option.DirectOutboundOptions{}}}
+			if test.detourHost != "" {
+				const detourType = "warp-test-detour"
+				registry := service.FromContext[adapter.OutboundRegistry](ctx).(*outbound.Registry)
+				outbound.Register[struct{}](registry, detourType, func(_ context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ struct{}) (adapter.Outbound, error) {
+					return &warpTestDetour{
+						Adapter:        outbound.NewAdapter(detourType, tag, []string{N.NetworkUDP}, nil),
+						peer:           M.ParseSocksaddrHostPort(test.detourHost, uint16(port)),
+						blackholeFirst: test.blackholeFirst,
+						firstPacket:    firstPacket,
+					}, nil
+				})
+				outbounds = append(outbounds, option.Outbound{Type: detourType, Tag: "proxy"})
+				warpOptions.Address = test.detourHost
+				warpOptions.Detour = "proxy"
+			}
+			var dnsOptions *option.DNSOptions
+			if test.resolvePeer {
+				hostsPath := filepath.Join(t.TempDir(), "hosts")
+				if err := os.WriteFile(hostsPath, []byte(test.detourHost+" warp-peer.test\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				dnsOptions = &option.DNSOptions{RawDNSOptions: option.RawDNSOptions{
+					Servers: []option.DNSServerOptions{{
+						Type: C.DNSTypeHosts, Tag: "warp-hosts", Options: &option.HostsDNSServerOptions{Path: []string{hostsPath}},
+					}},
+				}}
+				warpOptions.Address = "warp-peer.test"
+				warpOptions.DomainResolver = &option.DomainResolveOptions{Server: "warp-hosts"}
+			}
 			instance, err := box.New(box.Options{Context: ctx, Options: option.Options{
 				Log:          &option.LogOptions{Level: "warn"},
+				DNS:          dnsOptions,
 				Experimental: &option.ExperimentalOptions{CacheFile: &cacheOptions},
 				Endpoints: []option.Endpoint{
 					{Type: C.TypeWireGuard, Tag: "server", Options: &option.WireGuardEndpointOptions{WireGuardCommonOptions: option.WireGuardCommonOptions{
 						PrivateKey: serverKey.String(), ListenPort: uint16(port), Address: []netip.Prefix{netip.MustParsePrefix("10.77.0.1/32")},
 						Peers: []option.WireGuardPeer{{PublicKey: clientKey.PublicKey().String(), AllowedIPs: []netip.Prefix{netip.MustParsePrefix("10.77.0.2/32")}}},
 					}}},
-					{Type: C.TypeWARP, Tag: "warp", Options: &option.WARPEndpointOptions{
-						Kernel: true, System: test.system, Name: "warp-test", Amnezia: test.amnezia,
-						DialerOptions: option.DialerOptions{Detour: test.detour},
-					}},
+					{Type: C.TypeWARP, Tag: "warp", Options: warpOptions},
 				},
-				Outbounds: []option.Outbound{{Type: C.TypeDirect, Tag: "direct", Options: &option.DirectOutboundOptions{}}},
+				Outbounds: outbounds,
 				Route:     &option.RouteOptions{Final: "direct"},
 			}})
 			if err != nil {
@@ -126,7 +174,11 @@ func TestWARPLinuxBackends(t *testing.T) {
 					_, _ = io.WriteString(conn, "ok")
 				}
 			}()
-			dialCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+			dialTimeout := 8 * time.Second
+			if test.blackholeFirst {
+				dialTimeout = 20 * time.Second
+			}
+			dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
 			defer cancel()
 			conn, err := endpoint.DialContext(dialCtx, N.NetworkTCP, M.ParseSocksaddrHostPort("10.77.0.1", uint16(listener.Addr().(*net.TCPAddr).Port)))
 			if err != nil {
@@ -148,8 +200,66 @@ func TestWARPLinuxBackends(t *testing.T) {
 			if link.Type() != test.kind {
 				t.Fatalf("WARP link has kind %q, want %q", link.Type(), test.kind)
 			}
+			if test.blackholeFirst || test.system {
+				select {
+				case packet := <-firstPacket:
+					if test.blackholeFirst && (len(packet) < obfuscation.JMin || len(packet) > obfuscation.JMax) {
+						t.Fatalf("replacement detour began with a %d-byte packet, want AmneziaWG junk", len(packet))
+					}
+					if test.system && !bytes.Equal(packet, []byte{0xde, 0xad, 0xbe, 0xef}) {
+						t.Fatalf("userspace detour began with a %d-byte packet, want the AmneziaWG signature", len(packet))
+					}
+				default:
+					t.Fatal("detour sent no packet")
+				}
+			}
 		})
 	}
+}
+
+type warpTestDetour struct {
+	outbound.Adapter
+	peer           M.Socksaddr
+	blackholeFirst bool
+	dials          atomic.Int32
+	firstPacket    chan []byte
+}
+
+func (d *warpTestDetour) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	if network != N.NetworkUDP || destination != d.peer {
+		return nil, fmt.Errorf("unexpected WARP detour destination %s %s", network, destination)
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, network, M.ParseSocksaddrHostPort("127.0.0.1", d.peer.Port).String())
+	if err != nil {
+		return nil, err
+	}
+	return &warpTestDetourConn{
+		Conn: conn, discard: d.blackholeFirst && d.dials.Add(1) == 1, firstPacket: d.firstPacket,
+	}, nil
+}
+
+func (d *warpTestDetour) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
+	return nil, fmt.Errorf("expected a connected WARP UDP detour")
+}
+
+type warpTestDetourConn struct {
+	net.Conn
+	discard     bool
+	firstPacket chan []byte
+}
+
+func (c *warpTestDetourConn) Write(packet []byte) (int, error) {
+	if c.discard {
+		return len(packet), nil
+	}
+	if c.firstPacket != nil {
+		select {
+		case c.firstPacket <- bytes.Clone(packet):
+		default:
+		}
+		c.firstPacket = nil
+	}
+	return c.Conn.Write(packet)
 }
 
 func testWARPUDP(t *testing.T, ctx context.Context, endpoint adapter.Endpoint) {

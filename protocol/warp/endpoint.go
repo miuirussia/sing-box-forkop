@@ -162,31 +162,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 			},
 			MTU: 1280,
 		}
-		var wireguardEndpoint adapter.Endpoint
-		if options.Kernel && options.Amnezia != nil && *options.Amnezia != (option.OneSidedAmnezia{}) {
-			// Cloudflare speaks plain WireGuard, so keep the default headers and packet prefixes.
-			wireguardEndpoint, err = wireguard.NewAmneziaWGEndpoint(
-				ctx,
-				router,
-				logger,
-				tag,
-				option.AmneziaWGEndpointOptions{
-					WireGuardCommonOptions: wireguardOptions,
-					Amnezia:                &option.WireGuardAmnezia{OneSidedAmnezia: *options.Amnezia},
-				},
-			)
-		} else {
-			wireguardEndpoint, err = wireguard.NewEndpoint(
-				ctx,
-				router,
-				logger,
-				tag,
-				option.WireGuardEndpointOptions{
-					WireGuardCommonOptions: wireguardOptions,
-					Amnezia:                options.Amnezia,
-				},
-			)
-		}
+		wireguardEndpoint, err := wireguard.NewWARPEndpoint(ctx, router, logger, tag, wireguardOptions, options.Amnezia)
 		if err != nil {
 			logger.ErrorContext(ctx, err)
 			return

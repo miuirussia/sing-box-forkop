@@ -37,20 +37,23 @@ func TestDeviceRegistryIsOnePerBox(t *testing.T) {
 	require.Nil(t, deviceRegistryFromContext(context.Background()))
 }
 
-func sampleDeviceOptions() (option.WireGuardCommonOptions, *wireguard.AmneziaOptions) {
-	return option.WireGuardCommonOptions{
-		MTU:        1280,
-		Address:    badoption.Listable[netip.Prefix]{netip.MustParsePrefix("10.8.1.5/32")},
-		PrivateKey: "client-key",
-		Peers: []option.WireGuardPeer{{
-			Address:    "203.0.113.1",
-			Port:       51820,
-			PublicKey:  "server-key",
-			AllowedIPs: badoption.Listable[netip.Prefix]{netip.MustParsePrefix("0.0.0.0/0")},
-		}},
-	}, &wireguard.AmneziaOptions{
-		JC: 5,
-		S4: 12,
+func sampleDeviceConfiguration() deviceConfiguration {
+	return deviceConfiguration{
+		Type: "amneziawg",
+		Options: option.WireGuardCommonOptions{
+			DialerOptions: option.DialerOptions{Detour: "proxy"},
+			Kernel:        true,
+			MTU:           1280,
+			Address:       badoption.Listable[netip.Prefix]{netip.MustParsePrefix("10.8.1.5/32")},
+			PrivateKey:    "client-key",
+			Peers: []option.WireGuardPeer{{
+				Address:    "203.0.113.1",
+				Port:       51820,
+				PublicKey:  "server-key",
+				AllowedIPs: badoption.Listable[netip.Prefix]{netip.MustParsePrefix("0.0.0.0/0")},
+			}},
+		},
+		Amnezia: &wireguard.AmneziaOptions{JC: 5, S4: 12},
 	}
 }
 
@@ -58,44 +61,34 @@ func sampleDeviceOptions() (option.WireGuardCommonOptions, *wireguard.AmneziaOpt
 // device has to reach it; an option type that serialised only part of itself
 // would merge endpoints that are not the same.
 func TestSharedDeviceKeyCoversEverySetting(t *testing.T) {
-	options, amnezia := sampleDeviceOptions()
-	base, identities, err := sharedDeviceKey("amneziawg", options, amnezia)
+	config := sampleDeviceConfiguration()
+	base, identities, err := config.key()
 	require.NoError(t, err)
 	require.Equal(t, []string{"client-key/server-key"}, identities)
 
-	again, _, err := sharedDeviceKey("amneziawg", options, amnezia)
+	again, _, err := config.key()
 	require.NoError(t, err)
 	require.Equal(t, base, again)
 
-	for name, change := range map[string]func(*string, *option.WireGuardCommonOptions, *wireguard.AmneziaOptions){
-		"type": func(endpointType *string, _ *option.WireGuardCommonOptions, _ *wireguard.AmneziaOptions) {
-			*endpointType = "wireguard"
+	for name, change := range map[string]func(*deviceConfiguration){
+		"type":          func(c *deviceConfiguration) { c.Type = "wireguard" },
+		"kernel":        func(c *deviceConfiguration) { c.Options.Kernel = false },
+		"kernel detour": func(c *deviceConfiguration) { c.KernelDetour = true },
+		"mtu":           func(c *deviceConfiguration) { c.Options.MTU = 1420 },
+		"address":       func(c *deviceConfiguration) { c.Options.Address[0] = netip.MustParsePrefix("10.8.1.6/32") },
+		"private key":   func(c *deviceConfiguration) { c.Options.PrivateKey = "other-client-key" },
+		"detour":        func(c *deviceConfiguration) { c.Options.Detour = "other-proxy" },
+		"bind interface": func(c *deviceConfiguration) {
+			c.Options.BindInterface = "wan"
 		},
-		"kernel": func(_ *string, it *option.WireGuardCommonOptions, _ *wireguard.AmneziaOptions) { it.Kernel = true },
-		"mtu":    func(_ *string, it *option.WireGuardCommonOptions, _ *wireguard.AmneziaOptions) { it.MTU = 1420 },
-		"address": func(_ *string, it *option.WireGuardCommonOptions, _ *wireguard.AmneziaOptions) {
-			it.Address = badoption.Listable[netip.Prefix]{netip.MustParsePrefix("10.8.1.6/32")}
-		},
-		"private key": func(_ *string, it *option.WireGuardCommonOptions, _ *wireguard.AmneziaOptions) {
-			it.PrivateKey = "other-client-key"
-		},
-		"detour": func(_ *string, it *option.WireGuardCommonOptions, _ *wireguard.AmneziaOptions) { it.Detour = "Proxy" },
-		"bind interface": func(_ *string, it *option.WireGuardCommonOptions, _ *wireguard.AmneziaOptions) {
-			it.BindInterface = "wan"
-		},
-		"peer address": func(_ *string, it *option.WireGuardCommonOptions, _ *wireguard.AmneziaOptions) {
-			it.Peers = []option.WireGuardPeer{{Address: "203.0.113.2", Port: 51820, PublicKey: "server-key"}}
-		},
-		"peer key": func(_ *string, it *option.WireGuardCommonOptions, _ *wireguard.AmneziaOptions) {
-			it.Peers = []option.WireGuardPeer{{Address: "203.0.113.1", Port: 51820, PublicKey: "other-server-key"}}
-		},
-		"obfuscation": func(_ *string, _ *option.WireGuardCommonOptions, it *wireguard.AmneziaOptions) { it.S4 = 16 },
+		"peer address": func(c *deviceConfiguration) { c.Options.Peers[0].Address = "203.0.113.2" },
+		"peer key":     func(c *deviceConfiguration) { c.Options.Peers[0].PublicKey = "other-server-key" },
+		"obfuscation":  func(c *deviceConfiguration) { c.Amnezia.S4 = 16 },
 	} {
 		t.Run(name, func(t *testing.T) {
-			endpointType := "amneziawg"
-			changedOptions, changedAmnezia := sampleDeviceOptions()
-			change(&endpointType, &changedOptions, changedAmnezia)
-			changed, _, err := sharedDeviceKey(endpointType, changedOptions, changedAmnezia)
+			changedConfig := sampleDeviceConfiguration()
+			change(&changedConfig)
+			changed, _, err := changedConfig.key()
 			require.NoError(t, err)
 			require.NotEqual(t, base, changed)
 		})
@@ -103,13 +96,14 @@ func TestSharedDeviceKeyCoversEverySetting(t *testing.T) {
 }
 
 func TestPhobosDeviceIdentity(t *testing.T) {
-	options := option.WireGuardCommonOptions{}
-	base, _, err := sharedDeviceKey("phobos", options, nil, &phobos.Options{Key: "first", Masking: "STUN"})
+	config := deviceConfiguration{Type: "phobos", Phobos: &phobos.Options{Key: "first", Masking: "STUN"}}
+	base, _, err := config.key()
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, changed := range []*phobos.Options{{Key: "second", Masking: "STUN"}, {Key: "first", Masking: "MEDIA"}, {Key: "first", Masking: "STUN", ObfuscateBytes: 16}} {
-		key, _, err := sharedDeviceKey("phobos", options, nil, changed)
+		config.Phobos = changed
+		key, _, err := config.key()
 		if err != nil || key == base {
 			t.Fatalf("different Phobos settings share a device: %v", err)
 		}
