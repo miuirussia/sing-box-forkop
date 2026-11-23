@@ -83,16 +83,17 @@ func TestOpenKeepsV6WhenV4FamilyUnavailable(t *testing.T) {
 	if err != nil {
 		t.Skipf("environment without IPv6: %v", err)
 	}
+	wantPort := uint16(probe.LocalAddr().(*net.UDPAddr).Port)
 	probe.Close()
 
 	bind := NewStdNetBind(failFamilyControl("udp4", syscall.EAFNOSUPPORT)).(*StdNetBind)
-	fns, port, err := bind.Open(0)
+	fns, port, err := bind.Open(wantPort)
 	if err != nil {
 		t.Fatalf("Open must degrade to v6, got error: %v", err)
 	}
 	defer bind.Close()
-	if port == 0 {
-		t.Fatal("Open returned port 0")
+	if port != wantPort {
+		t.Fatalf("Open returned port %d, want %d", port, wantPort)
 	}
 	if len(fns) == 0 {
 		t.Fatal("Open returned no receive funcs")

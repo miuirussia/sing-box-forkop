@@ -32,7 +32,10 @@ var (
 	profileRetryMaxDelay     = time.Minute
 )
 
-var _ adapter.OutboundWithMultiplex = (*Endpoint)(nil)
+var (
+	_ adapter.InterfaceUpdateListener = (*Endpoint)(nil)
+	_ adapter.OutboundWithMultiplex   = (*Endpoint)(nil)
+)
 
 func RegisterEndpoint(registry *endpoint.Registry) {
 	endpoint.Register[option.WARPEndpointOptions](registry, C.TypeWARP, NewEndpoint)
@@ -141,15 +144,15 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 			Workers:       options.Workers,
 			DialerOptions: options.DialerOptions,
 			Address: badoption.Listable[netip.Prefix]{
-				netip.MustParsePrefix(config.Interface.Addresses.V4 + "/32"),
-				netip.MustParsePrefix(config.Interface.Addresses.V6 + "/128"),
+				netip.MustParsePrefix(strings.TrimSpace(config.Interface.Addresses.V4) + "/32"),
+				netip.MustParsePrefix(strings.TrimSpace(config.Interface.Addresses.V6) + "/128"),
 			},
 			PrivateKey: config.PrivateKey,
 			Peers: []option.WireGuardPeer{
 				{
 					Address:   peerAddress,
 					Port:      peerPort,
-					PublicKey: peer.PublicKey,
+					PublicKey: strings.TrimSpace(peer.PublicKey),
 					AllowedIPs: badoption.Listable[netip.Prefix]{
 						netip.MustParsePrefix("0.0.0.0/0"),
 						netip.MustParsePrefix("::/0"),
@@ -264,7 +267,7 @@ func validateConfig(config *Config) error {
 		return E.New("invalid IPv4 interface address")
 	}
 	v6, err := netip.ParseAddr(strings.TrimSpace(config.Interface.Addresses.V6))
-	if err != nil || !v6.Is6() {
+	if err != nil || !v6.Is6() || v6.Is4In6() || v6.Zone() != "" {
 		return E.New("invalid IPv6 interface address")
 	}
 	if len(config.Peers) == 0 {
@@ -323,6 +326,15 @@ func (w *Endpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 
 func (w *Endpoint) MultiplexEnabled() bool {
 	return true
+}
+
+func (w *Endpoint) InterfaceUpdated(ctx context.Context) {
+	w.access.RLock()
+	endpoint := w.endpoint
+	w.access.RUnlock()
+	if listener, ok := endpoint.(adapter.InterfaceUpdateListener); ok {
+		listener.InterfaceUpdated(ctx)
+	}
 }
 
 func (w *Endpoint) initializedEndpoint(ctx context.Context) (adapter.Endpoint, error) {

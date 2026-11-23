@@ -12,10 +12,16 @@ type URLTestOutboundOptions struct {
 	GroupCommonOption
 	URL                       string             `json:"url,omitempty"`
 	ExpectedStatus            string             `json:"expected_status,omitempty"`
+	UDPProbe                  *URLTestUDPProbe   `json:"udp_probe,omitempty"`
 	Interval                  badoption.Duration `json:"interval,omitempty"`
 	Tolerance                 uint16             `json:"tolerance,omitempty"`
 	IdleTimeout               badoption.Duration `json:"idle_timeout,omitempty"`
 	InterruptExistConnections bool               `json:"interrupt_exist_connections,omitempty"`
+}
+
+type URLTestUDPProbe struct {
+	ServerOptions
+	Domain string `json:"domain"`
 }
 
 type FallbackOutboundOptions struct {

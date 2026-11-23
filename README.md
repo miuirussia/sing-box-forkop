@@ -66,6 +66,10 @@ sing-box geodata export --kind geoip --file geoip.dat --tag ru --output ru.srs
 
 `ports` принимает один порт или список портов от 1 до 65535. По умолчанию проверяется порт 443. Проверки сохраняют SNI и порт исходного соединения, проверяют сертификат и пропускают локальные адреса и UDP. Результаты возвращает `GET /autodetect` с обычной авторизацией Clash API.
 
+## Проверка UDP в URLTest
+
+Для группы `urltest`, используемой как `detour` UDP-туннеля, можно задать `"udp_probe": {"server": "1.1.1.1", "domain": "example.com"}`. Группа будет выбирать UDP-выходы по ответам на DNS-запрос через каждый выход. `server` задаётся IP-адресом, `server_port` по умолчанию равен 53. Для TCP группа продолжает использовать HTTP-проверку.
+
 ## WireGuard в ядре Linux
 
 Добавьте `"kernel": true` в endpoint `wireguard`, `amneziawg`, `phobos` или `warp`. Нужны `CAP_NET_ADMIN` и модуль `wireguard` либо `amneziawg`. WARP с обфускацией пробует `amneziawg`, обычный WARP использует `wireguard`. Phobos помещает внутренний UDP-порт WireGuard в отдельное сетевое пространство имён, для чего нужен `CAP_SYS_ADMIN`.

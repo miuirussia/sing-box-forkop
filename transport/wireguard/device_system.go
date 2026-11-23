@@ -25,6 +25,7 @@ type systemDevice struct {
 	options      DeviceOptions
 	dialer       N.Dialer
 	device       tun.Tun
+	closeRoutes  func() error
 	batchDevice  tun.LinuxTUN
 	events       chan wgTun.Event
 	closeOnce    sync.Once
@@ -106,23 +107,30 @@ func (w *systemDevice) Start() error {
 	if runtime.GOOS == "darwin" {
 		tunOptions.AutoRoute = true
 	}
-	tunInterface, err := tun.New(tunOptions)
+	tunInterface, closeRoutes, err := startSystemTun(tunOptions)
 	if err != nil {
-		return err
-	}
-	err = tunInterface.Start()
-	if err != nil {
-		tunInterface.Close()
 		return err
 	}
 	w.options.Logger.Info("started at ", w.options.Name)
 	w.device = tunInterface
+	w.closeRoutes = closeRoutes
 	batchTUN, isBatchTUN := tunInterface.(tun.LinuxTUN)
 	if isBatchTUN && batchTUN.BatchSize() > 1 {
 		w.batchDevice = batchTUN
 	}
 	w.events <- wgTun.EventUp
 	return nil
+}
+
+func openSystemTun(options tun.Options) (tun.Tun, error) {
+	tunInterface, err := tun.New(options)
+	if err != nil {
+		return nil, err
+	}
+	if err = tunInterface.Start(); err != nil {
+		return nil, errors.Join(err, tunInterface.Close())
+	}
+	return tunInterface, nil
 }
 
 func (w *systemDevice) File() *os.File {
@@ -183,8 +191,11 @@ func (w *systemDevice) Close() error {
 	var err error
 	w.closeOnce.Do(func() {
 		close(w.events)
+		if w.closeRoutes != nil {
+			err = w.closeRoutes()
+		}
 		if w.device != nil {
-			err = w.device.Close()
+			err = errors.Join(err, w.device.Close())
 		}
 	})
 	return err

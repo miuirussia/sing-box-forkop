@@ -28,7 +28,6 @@ type systemStackDevice struct {
 	endpoint      *deviceEndpoint
 	icmpForwarder *tun.ICMPForwarder
 	udpForwarder  *tun.UDPForwarder
-	writeBufs     [][]byte
 	closeOnce     sync.Once
 }
 
@@ -109,14 +108,14 @@ func (w *systemStackDevice) Start() error {
 
 func (w *systemStackDevice) Write(bufs [][]byte, offset int) (count int, err error) {
 	if w.batchDevice != nil {
-		w.writeBufs = w.writeBufs[:0]
+		writeBufs := make([][]byte, 0, len(bufs))
 		for _, packet := range bufs {
 			if !w.writeStack(packet[offset:]) {
-				w.writeBufs = append(w.writeBufs, packet)
+				writeBufs = append(writeBufs, packet)
 			}
 		}
-		if len(w.writeBufs) > 0 {
-			return w.batchDevice.BatchWrite(w.writeBufs, offset)
+		if len(writeBufs) > 0 {
+			return w.batchDevice.BatchWrite(writeBufs, offset)
 		}
 	} else {
 		for _, packet := range bufs {

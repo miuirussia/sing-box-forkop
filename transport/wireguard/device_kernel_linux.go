@@ -214,23 +214,15 @@ func (d *linuxKernelDevice) addAddresses(addresses []netip.Prefix, system bool) 
 	defer kernelSetupAccess.Unlock()
 
 	if slices.ContainsFunc(addresses, func(address netip.Prefix) bool { return address.Addr().Is4() }) {
-		assigned, err := netlink.AddrList(nil, unix.AF_INET)
+		conflict, err := conflictingLocalIPv4(addresses)
 		if err != nil {
 			return kernelSetupError("list local IPv4 addresses", err)
 		}
-		// The source routing rule cannot distinguish tunnels with the same IPv4 address.
-		for _, address := range addresses {
-			if !address.Addr().Is4() {
-				continue
-			}
-			ip := net.IP(address.Addr().AsSlice())
-			if !slices.ContainsFunc(assigned, func(existing netlink.Addr) bool { return existing.IP.Equal(ip) }) {
-				continue
-			}
+		if conflict.IsValid() {
 			if system {
-				return fmt.Errorf("system mode requires a unique local IPv4 address: %s is already assigned", ip)
+				return fmt.Errorf("system mode requires a unique local IPv4 address: %s is already assigned", conflict)
 			}
-			return fmt.Errorf("%w: local IPv4 address %s is already assigned", errKernelUnavailable, ip)
+			return fmt.Errorf("%w: local IPv4 address %s is already assigned", errKernelUnavailable, conflict)
 		}
 	}
 	for _, address := range addresses {
@@ -246,13 +238,28 @@ func (d *linuxKernelDevice) addAddresses(addresses []netip.Prefix, system bool) 
 	return nil
 }
 
+// The source rule cannot distinguish tunnels with the same IPv4 address.
+func conflictingLocalIPv4(addresses []netip.Prefix) (netip.Addr, error) {
+	assigned, err := netlink.AddrList(nil, unix.AF_INET)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	for _, address := range addresses {
+		ip := address.Addr()
+		if ip.Is4() && slices.ContainsFunc(assigned, func(existing netlink.Addr) bool { return existing.IP.Equal(ip.AsSlice()) }) {
+			return ip, nil
+		}
+	}
+	return netip.Addr{}, nil
+}
+
 func (d *linuxKernelDevice) addRoutes(addresses, allowed []netip.Prefix) error {
 	if len(allowed) == 0 {
 		return nil
 	}
 	kernelSetupAccess.Lock()
 	defer kernelSetupAccess.Unlock()
-	table, err := freeKernelRouteTable(d.link.Attrs().Index)
+	table, err := freeTunnelRouteTable(d.link.Attrs().Index)
 	if err != nil {
 		return err
 	}
@@ -279,46 +286,56 @@ func (d *linuxKernelDevice) addRoutes(addresses, allowed []netip.Prefix) error {
 			hasRoute = true
 		}
 		if hasRoute {
-			// The output-interface selector matches sockets bound to this tunnel.
-			rule := netlink.NewRule()
-			rule.Family = family
-			rule.Priority = 100
-			rule.Table = table
-			rule.OifName = d.link.Attrs().Name
-			err = d.addRule(rule)
+			err = addTunnelRouteRules(&d.rules, d.link.Attrs().Name, family, table, addresses)
 			if err != nil {
 				return err
-			}
-			// IPv4 reverse-path validation looks up the remote IP from the
-			// tunnel address without using the socket's output interface.
-			for _, address := range addresses {
-				if address.Addr().Is4() != ipv4 {
-					continue
-				}
-				sourceRule := netlink.NewRule()
-				sourceRule.Family = family
-				sourceRule.Priority = 101
-				sourceRule.Table = table
-				sourceRule.Src = netip.PrefixFrom(address.Addr(), address.Addr().BitLen())
-				err = d.addRule(sourceRule)
-				if err != nil {
-					return err
-				}
 			}
 		}
 	}
 	return nil
 }
 
-func (d *linuxKernelDevice) addRule(rule *netlink.Rule) error {
+func addTunnelRouteRules(rules *[]*netlink.Rule, name string, family, table int, addresses []netip.Prefix) error {
+	// Match sockets bound to this tunnel.
+	rule := netlink.NewRule()
+	rule.Family = family
+	rule.Priority = 100
+	rule.Table = table
+	rule.OifName = name
 	if err := netlink.RuleAdd(rule); err != nil {
 		return err
 	}
-	d.rules = append(d.rules, rule)
+	*rules = append(*rules, rule)
+	// Reverse-path validation can look up the remote IP without an output interface.
+	for _, address := range addresses {
+		ip := address.Addr()
+		if ip.Is4() != (family == unix.AF_INET) {
+			continue
+		}
+		sourceRule := netlink.NewRule()
+		sourceRule.Family = family
+		sourceRule.Priority = 101
+		sourceRule.Table = table
+		sourceRule.Src = netip.PrefixFrom(ip, ip.BitLen())
+		if err := netlink.RuleAdd(sourceRule); err != nil {
+			return err
+		}
+		*rules = append(*rules, sourceRule)
+	}
 	return nil
 }
 
-func freeKernelRouteTable(index int) (int, error) {
+func removeTunnelRouteRules(rules []*netlink.Rule) error {
+	var errs []error
+	for _, rule := range rules {
+		if err := netlink.RuleDel(rule); err != nil && !errors.Is(err, unix.ENOENT) {
+			errs = append(errs, fmt.Errorf("remove WireGuard routing rule: %w", err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func freeTunnelRouteTable(index int) (int, error) {
 	const first, size = 0x53420000, 1 << 16
 	used := make(map[int]bool)
 	routes, err := netlink.RouteListFiltered(unix.AF_UNSPEC, &netlink.Route{}, netlink.RT_FILTER_TABLE)
@@ -341,7 +358,7 @@ func freeKernelRouteTable(index int) (int, error) {
 			return table, nil
 		}
 	}
-	return 0, errors.New("no free kernel WireGuard routing table")
+	return 0, errors.New("no free WireGuard routing table")
 }
 
 func prefixIPNet(prefix netip.Prefix) *net.IPNet {
@@ -386,11 +403,7 @@ func (d *linuxKernelDevice) Close() error {
 	if d.relay != nil {
 		errs = append(errs, d.relay.Close())
 	}
-	for _, rule := range d.rules {
-		if err := netlink.RuleDel(rule); err != nil && !errors.Is(err, unix.ENOENT) {
-			errs = append(errs, fmt.Errorf("remove kernel WireGuard routing rule: %w", err))
-		}
-	}
+	errs = append(errs, removeTunnelRouteRules(d.rules))
 	if err := netlink.LinkDel(d.link); err != nil && !errors.Is(err, unix.ENODEV) {
 		errs = append(errs, fmt.Errorf("remove kernel WireGuard interface: %w", err))
 	}

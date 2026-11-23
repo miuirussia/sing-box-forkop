@@ -175,7 +175,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 		conn = tracker.RoutedConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
 	}
 	ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
-	onClose = registerInterrupt(chain, conn, onClose)
+	onClose = registerInterrupt(chain, N.NetworkTCP, conn, onClose)
 	outbound := chain[len(chain)-1]
 	if outboundHandler, isHandler := outbound.(adapter.ConnectionHandler); isHandler {
 		outboundHandler.NewConnection(ctx, conn, metadata, onClose)
@@ -207,14 +207,20 @@ func resolveOutbound(outbound adapter.Outbound, network string) ([]adapter.Outbo
 	return chain, nil
 }
 
-func registerInterrupt(chain []adapter.Outbound, closer io.Closer, onClose N.CloseHandlerFunc) N.CloseHandlerFunc {
+func registerInterrupt(chain []adapter.Outbound, network string, closer io.Closer, onClose N.CloseHandlerFunc) N.CloseHandlerFunc {
 	var removers []func()
 	for _, outbound := range chain {
 		group, isGroup := outbound.(adapter.OutboundGroup)
 		if !isGroup {
 			continue
 		}
-		removers = append(removers, group.AttachConnection(closer))
+		if networkGroup, ok := group.(interface {
+			AttachConnectionForNetwork(network string, closer io.Closer) func()
+		}); ok {
+			removers = append(removers, networkGroup.AttachConnectionForNetwork(network, closer))
+		} else {
+			removers = append(removers, group.AttachConnection(closer))
+		}
 	}
 	if len(removers) == 0 {
 		return onClose
@@ -357,7 +363,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 		conn = newFakeIPNATPacketConn(bufio.NewNetPacketConn(conn), metadata.OriginDestination, metadata.Destination)
 	}
 	ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
-	onClose = registerInterrupt(chain, conn, onClose)
+	onClose = registerInterrupt(chain, N.NetworkUDP, conn, onClose)
 	outbound := chain[len(chain)-1]
 	if outboundHandler, isHandler := outbound.(adapter.PacketConnectionHandler); isHandler {
 		outboundHandler.NewPacketConnection(ctx, conn, metadata, onClose)

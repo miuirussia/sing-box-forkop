@@ -362,6 +362,11 @@ func (e *Endpoint) createBind() (conn.Bind, bool) {
 	if isUDPListener {
 		listenerControl, egressEnabled := udpListener.UDPListenerControl()
 		standardBind := conn.NewStdNetBind(listenerControl).(*conn.StdNetBind)
+		if directDialer, ok := udpListener.(*dialer.DefaultDialer); ok {
+			standardBind.SetListenUDP(func(config net.ListenConfig, network string, port int) (*net.UDPConn, error) {
+				return directDialer.ListenUDPWithConfig(e.options.Context, config, network, port)
+			})
+		}
 		if e.options.ListenPort == 0 && len(e.peers) == 1 && e.peers[0].endpoint.IsValid() {
 			standardBind.SetSinglePeerMode()
 		}

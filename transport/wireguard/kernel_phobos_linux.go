@@ -3,6 +3,7 @@
 package wireguard
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -10,11 +11,14 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/netlink"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/wireguard-go/conn"
+	"github.com/sagernet/wireguard-go/device"
 	"github.com/vishvananda/netns"
 
 	"golang.org/x/sys/unix"
@@ -23,6 +27,7 @@ import (
 type kernelPhobosRelay struct {
 	endpoint      *Endpoint
 	bind          conn.Bind
+	detour        *ClientBind
 	receive       []conn.ReceiveFunc
 	peers         map[string]*kernelPhobosPeer
 	workers       sync.WaitGroup
@@ -31,8 +36,9 @@ type kernelPhobosRelay struct {
 }
 
 type kernelPhobosPeer struct {
-	local  *net.UDPConn
-	remote conn.Endpoint
+	local            *net.UDPConn
+	remote           conn.Endpoint
+	handshakePending atomic.Bool
 }
 
 func newKernelPhobosRelay(endpoint *Endpoint) (_ *kernelPhobosRelay, _ []peerConfig, _ netlink.Link, err error) {
@@ -44,6 +50,9 @@ func newKernelPhobosRelay(endpoint *Endpoint) (_ *kernelPhobosRelay, _ []peerCon
 		endpoint: endpoint,
 		bind:     bind,
 		peers:    make(map[string]*kernelPhobosPeer),
+	}
+	if detour, ok := common.Cast[*ClientBind](bind); ok && detour.isConnect {
+		relay.detour = detour
 	}
 	defer func() {
 		if err != nil {
@@ -178,6 +187,11 @@ func (r *kernelPhobosRelay) run() {
 				if source != r.kernelAddress {
 					continue
 				}
+				if r.detour != nil && size == device.MessageInitiationSize &&
+					binary.LittleEndian.Uint32(packet) == device.MessageInitiationType && peer.handshakePending.Swap(true) {
+					// The kernel only knows the loopback endpoint and cannot reset the outer session.
+					r.detour.clearPath()
+				}
 				err = r.bind.Send([][]byte{packet[:size]}, peer.remote, 0)
 				if err != nil && !errors.Is(err, net.ErrClosed) {
 					r.endpoint.options.Logger.Debug("send Phobos UDP: ", err)
@@ -206,6 +220,7 @@ func (r *kernelPhobosRelay) rebind() error {
 		if err := peer.local.SetReadDeadline(time.Time{}); err != nil {
 			return err
 		}
+		peer.handshakePending.Store(false)
 	}
 	receive, port, err := r.bind.Open(r.listenPort)
 	if err != nil {
@@ -240,6 +255,9 @@ func (r *kernelPhobosRelay) receivePackets(receive conn.ReceiveFunc, kernelAddre
 			peer := r.peers[sources[i].DstToString()]
 			if peer == nil {
 				continue
+			}
+			if r.detour != nil {
+				peer.handshakePending.Store(false)
 			}
 			_, err = peer.local.WriteToUDPAddrPort(packets[i][:sizes[i]], kernelAddress)
 			if err != nil && !errors.Is(err, net.ErrClosed) {

@@ -107,8 +107,9 @@ func (c *ClientBind) connect() (*wireConn, error) {
 		if err != nil {
 			return nil, err
 		}
+		// A detour's RemoteAddr can identify the proxy transport instead of the peer.
 		serverConn = &wireConn{
-			PacketConn: bufio.NewUnbindPacketConn(udpConn),
+			PacketConn: bufio.NewUnbindPacketConnWithAddr(udpConn, c.connectAddr),
 			done:       make(chan struct{}),
 		}
 	} else {

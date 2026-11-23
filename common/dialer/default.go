@@ -217,7 +217,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 	if options.Inet6BindAddress != nil {
 		bindAddr := options.Inet6BindAddress.Build(netip.IPv6Unspecified())
 		dialer6.LocalAddr = &net.TCPAddr{IP: bindAddr.AsSlice()}
-		udpDialer6.LocalAddr = &net.UDPAddr{IP: bindAddr.AsSlice(), Port: int(options.UDPBindPort)}
+		udpDialer6.LocalAddr = &net.UDPAddr{IP: bindAddr.AsSlice(), Port: int(options.UDPBindPort), Zone: bindAddr.Zone()}
 		udpAddr6 = M.SocksaddrFrom(bindAddr, options.UDPBindPort).String()
 	} else if options.UDPBindPort != 0 {
 		udpDialer6.LocalAddr = &net.UDPAddr{IP: net.IPv6unspecified, Port: int(options.UDPBindPort)}
@@ -423,6 +423,26 @@ func (d *DefaultDialer) UDPListenerControl() (control.Func, bool) {
 		listenerControl = control.Append(listenerControl, d.autoDetectBindFunc)
 	}
 	return listenerControl, egressEnabled
+}
+
+// ListenUDPWithConfig applies the dialer's source address and namespace to a native UDP listener.
+func (d *DefaultDialer) ListenUDPWithConfig(ctx context.Context, config net.ListenConfig, network string, port int) (*net.UDPConn, error) {
+	localAddr := d.udpDialer4.LocalAddr
+	if network == "udp6" {
+		localAddr = d.udpDialer6.LocalAddr
+	}
+	address := net.UDPAddr{Port: port}
+	if local, ok := localAddr.(*net.UDPAddr); ok {
+		address.IP = local.IP
+		address.Zone = local.Zone
+	}
+	return listener.ListenNetworkNamespace(ctx, d.netns, func() (*net.UDPConn, error) {
+		conn, err := config.ListenPacket(ctx, network, address.String())
+		if err != nil {
+			return nil, err
+		}
+		return conn.(*net.UDPConn), nil
+	})
 }
 
 func (d *DefaultDialer) trackConn(ctx context.Context, destination M.Socksaddr, conn net.Conn, err error) (net.Conn, error) {

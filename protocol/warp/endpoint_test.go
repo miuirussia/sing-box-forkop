@@ -44,6 +44,8 @@ func TestWARPConfigValidation(t *testing.T) {
 		{name: "empty ports", mutate: func(config *Config) { config.Peers[0].Endpoint.Ports = nil }},
 		{name: "invalid IPv4 address", mutate: func(config *Config) { config.Interface.Addresses.V4 = "not-an-ip" }},
 		{name: "invalid IPv6 address", mutate: func(config *Config) { config.Interface.Addresses.V6 = "not-an-ip" }},
+		{name: "zoned IPv6 address", mutate: func(config *Config) { config.Interface.Addresses.V6 = "fe80::2%eth0" }},
+		{name: "IPv4 mapped as IPv6", mutate: func(config *Config) { config.Interface.Addresses.V6 = "::ffff:172.16.0.2" }},
 		{name: "empty peer key", mutate: func(config *Config) { config.Peers[0].PublicKey = "" }},
 		{name: "invalid peer key", mutate: func(config *Config) { config.Peers[0].PublicKey = "invalid" }},
 		{name: "empty peer host", mutate: func(config *Config) { config.Peers[0].Endpoint.Host = "" }},
@@ -256,5 +258,31 @@ func TestWARPEndpointReportsWireGuardSession(t *testing.T) {
 	multiplexOutbound, isMultiplex := common.Cast[adapter.OutboundWithMultiplex](&Endpoint{})
 	if !isMultiplex || !multiplexOutbound.MultiplexEnabled() {
 		t.Fatal("WARP did not report its WireGuard session")
+	}
+}
+
+type interfaceUpdateTestEndpoint struct {
+	adapter.Endpoint
+	updateContext context.Context
+}
+
+func (e *interfaceUpdateTestEndpoint) InterfaceUpdated(ctx context.Context) {
+	e.updateContext = ctx
+}
+
+func TestWARPEndpointForwardsInterfaceUpdate(t *testing.T) {
+	var endpoint adapter.Endpoint = &Endpoint{}
+	listener, ok := endpoint.(adapter.InterfaceUpdateListener)
+	if !ok {
+		t.Fatal("WARP is not registered as an interface update listener")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	listener.InterfaceUpdated(ctx)
+	inner := new(interfaceUpdateTestEndpoint)
+	endpoint.(*Endpoint).endpoint = inner
+	listener.InterfaceUpdated(ctx)
+	if inner.updateContext != ctx {
+		t.Fatal("WARP did not forward the interface update to WireGuard")
 	}
 }

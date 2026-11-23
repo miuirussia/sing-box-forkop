@@ -23,6 +23,8 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
+
+	"github.com/miekg/dns"
 )
 
 func TestURLTestGroupHistoryIsIsolated(t *testing.T) {
@@ -58,6 +60,283 @@ type initialURLTestOutbound struct {
 
 func (o *initialURLTestOutbound) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
 	return net.ListenPacket("udp", "127.0.0.1:0")
+}
+
+type udpProbeTestOutbound struct {
+	*fallbackHealthTestOutbound
+	wrongReply bool
+	beforeUDP  func(context.Context, M.Socksaddr) error
+}
+
+func (o *udpProbeTestOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	if network != N.NetworkUDP {
+		return o.fallbackHealthTestOutbound.DialContext(ctx, network, destination)
+	}
+	if o.beforeUDP != nil {
+		if err := o.beforeUDP(ctx, destination); err != nil {
+			return nil, err
+		}
+	}
+	client, server := net.Pipe()
+	go func() {
+		defer server.Close()
+		buffer := make([]byte, 4096)
+		count, err := server.Read(buffer)
+		if err != nil {
+			return
+		}
+		var query dns.Msg
+		if query.Unpack(buffer[:count]) != nil {
+			return
+		}
+		response := new(dns.Msg).SetReply(&query)
+		if o.wrongReply {
+			response.Id++
+		}
+		payload, err := response.Pack()
+		if err == nil {
+			_, _ = server.Write(payload)
+		}
+	}()
+	return client, nil
+}
+
+func (o *udpProbeTestOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	if o.beforeUDP != nil {
+		if err := o.beforeUDP(ctx, destination); err != nil {
+			return nil, err
+		}
+	}
+	return net.ListenPacket("udp4", "127.0.0.1:0")
+}
+
+func enableTestUDPProbe(t *testing.T, group *URLTestGroup) {
+	t.Helper()
+	probe, err := urltest.NewUDPProbe(M.ParseSocksaddr("192.0.2.53:53"), "health.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.setUDPProbe(probe)
+}
+
+func TestURLTestChecksUDPIndependentlyOfTCP(t *testing.T) {
+	first := &udpProbeTestOutbound{fallbackHealthTestOutbound: newFallbackHealthTestOutbound("first", true), wrongReply: true}
+	second := &udpProbeTestOutbound{fallbackHealthTestOutbound: newFallbackHealthTestOutbound("second", true)}
+	group := newDialTestURLTest(t, first, second).group
+	enableTestUDPProbe(t, group)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := group.selectForDial(ctx, N.NetworkUDP)
+	if err != nil || got != second {
+		t.Fatalf("UDP selection = %v, %v, want second", got, err)
+	}
+	got, err = group.selectForDial(ctx, N.NetworkTCP)
+	if err != nil || got != first {
+		t.Fatalf("TCP selection = %v, %v, want first", got, err)
+	}
+}
+
+type splitURLTestOutbound struct {
+	*fallbackHistoryGroupOutbound
+	udp adapter.Outbound
+}
+
+func (o *splitURLTestOutbound) Selected(network string) adapter.Outbound {
+	if network == N.NetworkUDP {
+		return o.udp
+	}
+	return o.selected
+}
+
+func (o *splitURLTestOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	return o.Selected(network).DialContext(ctx, network, destination)
+}
+
+func TestURLTestProbesTheNestedGroupsUDPExit(t *testing.T) {
+	tcpExit := &udpProbeTestOutbound{fallbackHealthTestOutbound: newFallbackHealthTestOutbound("tcp-exit", true), wrongReply: true}
+	udpExit := &udpProbeTestOutbound{fallbackHealthTestOutbound: newFallbackHealthTestOutbound("udp-exit", true)}
+	nested := &splitURLTestOutbound{
+		fallbackHistoryGroupOutbound: &fallbackHistoryGroupOutbound{
+			fallbackHealthTestOutbound: newFallbackHealthTestOutbound("nested", true),
+			selected:                   tcpExit,
+		},
+		udp: udpExit,
+	}
+	manager := &testOutboundManager{outbounds: map[string]adapter.Outbound{
+		nested.Tag(): nested, tcpExit.Tag(): tcpExit, udpExit.Tag(): udpExit,
+	}}
+	group, err := NewURLTestGroup(t.Context(), manager, log.NewNOPFactory().NewLogger("test"),
+		[]adapter.Outbound{nested}, "http://health.test/generate_204", nil, time.Hour, 0, time.Hour, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enableTestUDPProbe(t, group)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	for _, network := range []string{N.NetworkUDP, N.NetworkTCP} {
+		got, err := group.selectForDial(ctx, network)
+		if err != nil || got != nested {
+			t.Fatalf("%s selection = %v, %v, want nested", network, got, err)
+		}
+	}
+}
+
+type urlTestTrackedCloser struct{ closed bool }
+
+func (c *urlTestTrackedCloser) Close() error {
+	c.closed = true
+	return nil
+}
+
+func TestURLTestUDPFailureOnlyInterruptsUDP(t *testing.T) {
+	for _, interruptExternal := range []bool{false, true} {
+		t.Run(fmt.Sprintf("interrupt_external_%t", interruptExternal), func(t *testing.T) {
+			member := &udpProbeTestOutbound{fallbackHealthTestOutbound: newFallbackHealthTestOutbound("exit", true)}
+			outbound := newDialTestURLTest(t, member)
+			group := outbound.group
+			group.interruptExternalConnections = interruptExternal
+			enableTestUDPProbe(t, group)
+			group.CheckOutbounds(t.Context(), true)
+			tcp, err := outbound.DialContext(t.Context(), N.NetworkTCP, M.ParseSocksaddr("192.0.2.1:80"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tcp.Close()
+			udp, err := outbound.ListenPacket(t.Context(), M.ParseSocksaddr("192.0.2.1:51820"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer udp.Close()
+			externalTCP, externalUDP := &urlTestTrackedCloser{}, &urlTestTrackedCloser{}
+			defer outbound.AttachConnectionForNetwork(N.NetworkTCP, externalTCP)()
+			defer outbound.AttachConnectionForNetwork(N.NetworkUDP, externalUDP)()
+
+			member.wrongReply = true
+			group.CheckOutbounds(t.Context(), true)
+
+			if err = udp.SetReadDeadline(time.Now()); !errors.Is(err, net.ErrClosed) {
+				t.Errorf("UDP was not interrupted, setting a deadline returned %v", err)
+			}
+			if err = tcp.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = io.WriteString(tcp, "GET / HTTP/1.0\r\n\r\n"); err != nil {
+				t.Errorf("UDP probe interrupted TCP: %v", err)
+			}
+			if externalTCP.closed || externalUDP.closed != interruptExternal {
+				t.Errorf("external connections closed: TCP = %t, UDP = %t, want TCP = false, UDP = %t",
+					externalTCP.closed, externalUDP.closed, interruptExternal)
+			}
+		})
+	}
+}
+
+func TestURLTestUDPDialSwitchInterruptsPreviousConnections(t *testing.T) {
+	first := &udpProbeTestOutbound{fallbackHealthTestOutbound: newFallbackHealthTestOutbound("first", true)}
+	second := &udpProbeTestOutbound{fallbackHealthTestOutbound: newFallbackHealthTestOutbound("second", true)}
+	outbound := newDialTestURLTest(t, first, second)
+	group := outbound.group
+	enableTestUDPProbe(t, group)
+	group.udpHistory.StoreURLTestHistory(first.Tag(), &adapter.URLTestHistory{Time: time.Now(), Delay: 10})
+	group.udpHistory.StoreURLTestHistory(second.Tag(), &adapter.URLTestHistory{Time: time.Now(), Delay: 20})
+	group.performUpdateCheck()
+	if selected, err := group.selectForDial(t.Context(), N.NetworkUDP); err != nil || selected != first {
+		t.Fatalf("initial UDP selection = %v, %v, want first", selected, err)
+	}
+	packet, err := outbound.ListenPacket(t.Context(), M.ParseSocksaddr("192.0.2.1:51820"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer packet.Close()
+	group.deleteDialHistory(t.Context(), first, N.NetworkUDP)
+	if selected, err := group.selectForDial(t.Context(), N.NetworkUDP); err != nil || selected != second {
+		t.Fatalf("UDP selection after failure = %v, %v, want second", selected, err)
+	}
+	if err := packet.SetReadDeadline(time.Now()); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("previous UDP connection was not interrupted, setting a deadline returned %v", err)
+	}
+}
+
+func TestURLTestKeepsTheNewerUDPProbeResult(t *testing.T) {
+	for _, olderFailed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("older_failed_%t", olderFailed), func(t *testing.T) {
+			started := make(chan struct{})
+			release := make(chan struct{})
+			var once sync.Once
+			member := &udpProbeTestOutbound{
+				fallbackHealthTestOutbound: newFallbackHealthTestOutbound("exit", true),
+				beforeUDP: func(ctx context.Context, _ M.Socksaddr) error {
+					older := false
+					once.Do(func() { older = true })
+					if older {
+						close(started)
+						select {
+						case <-release:
+						case <-ctx.Done():
+							return ctx.Err()
+						}
+					}
+					if older == olderFailed {
+						return errors.New("UDP unavailable")
+					}
+					return nil
+				},
+			}
+			group := newDialTestURLTest(t, member).group
+			enableTestUDPProbe(t, group)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				group.CheckOutbounds(t.Context(), false)
+			}()
+			<-started
+			group.CheckOutbounds(t.Context(), true)
+			_, tested := group.Select(N.NetworkUDP)
+			close(release)
+			<-done
+			if tested != olderFailed {
+				t.Fatalf("newer UDP probe tested = %t, want %t", tested, olderFailed)
+			}
+			if _, tested = group.Select(N.NetworkUDP); tested != olderFailed {
+				t.Fatalf("older UDP probe changed tested to %t, want %t", tested, olderFailed)
+			}
+		})
+	}
+}
+
+func TestURLTestCanceledUDPDialKeepsProbeResult(t *testing.T) {
+	for _, network := range []string{"udp", "packet"} {
+		t.Run(network, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			member := &udpProbeTestOutbound{
+				fallbackHealthTestOutbound: newFallbackHealthTestOutbound("exit", true),
+				beforeUDP: func(ctx context.Context, destination M.Socksaddr) error {
+					if destination.Port == 51820 {
+						cancel()
+						return ctx.Err()
+					}
+					return nil
+				},
+			}
+			outbound := newDialTestURLTest(t, member)
+			enableTestUDPProbe(t, outbound.group)
+			outbound.group.CheckOutbounds(t.Context(), true)
+			destination := M.ParseSocksaddr("192.0.2.1:51820")
+			var err error
+			if network == "packet" {
+				_, err = outbound.ListenPacket(ctx, destination)
+			} else {
+				_, err = outbound.DialContext(ctx, N.NetworkUDP, destination)
+			}
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("dial returned %v, want context.Canceled", err)
+			}
+			if _, tested := outbound.group.Select(N.NetworkUDP); !tested {
+				t.Fatal("canceled dial invalidated the successful UDP probe")
+			}
+		})
+	}
 }
 
 // A tunnel must not dial the first subscription member while its probe is

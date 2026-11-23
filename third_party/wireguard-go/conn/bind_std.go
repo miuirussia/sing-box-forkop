@@ -38,6 +38,7 @@ var _ Bind = (*StdNetBind)(nil)
 // proposal in https://github.com/golang/go/issues/45886#issuecomment-1218301564.
 type StdNetBind struct {
 	externalControl     control.Func
+	listenUDP           func(net.ListenConfig, string, int) (*net.UDPConn, error)
 	egressProvider      EgressProvider
 	onRead              func(size int)
 	onWrite             func(size int)
@@ -140,7 +141,13 @@ func (e *StdNetEndpoint) DstToString() string {
 	return e.AddrPort.String()
 }
 
-func listenNet(externalControl control.Func, network string, port int) (*net.UDPConn, int, error) {
+// SetListenUDP customizes socket creation while preserving the bind's socket controls.
+// Call it before Open.
+func (s *StdNetBind) SetListenUDP(listen func(net.ListenConfig, string, int) (*net.UDPConn, error)) {
+	s.listenUDP = listen
+}
+
+func (s *StdNetBind) listenNet(network string, port int) (*net.UDPConn, int, error) {
 	var listenerAddr string
 	if network == "udp6" {
 		listenerAddr = "[::]:" + strconv.Itoa(port)
@@ -156,27 +163,27 @@ func listenNet(externalControl control.Func, network string, port int) (*net.UDP
 				return err
 			}
 		}
-		if externalControl != nil {
-			return externalControl(network, address, conn)
+		if s.externalControl != nil {
+			return s.externalControl(network, address, conn)
 		} else {
 			return nil
 		}
 	}
-	conn, err := listener.ListenPacket(context.Background(), network, listenerAddr)
-	if err != nil {
-		return nil, 0, err
+	var udpConn *net.UDPConn
+	if s.listenUDP != nil {
+		var err error
+		udpConn, err = s.listenUDP(listener, network, port)
+		if err != nil {
+			return nil, port, err
+		}
+	} else {
+		packetConn, err := listener.ListenPacket(context.Background(), network, listenerAddr)
+		if err != nil {
+			return nil, port, err
+		}
+		udpConn = packetConn.(*net.UDPConn)
 	}
-
-	// Retrieve port.
-	laddr := conn.LocalAddr()
-	uaddr, err := net.ResolveUDPAddr(
-		laddr.Network(),
-		laddr.String(),
-	)
-	if err != nil {
-		return nil, 0, err
-	}
-	return conn.(*net.UDPConn), uaddr.Port, nil
+	return udpConn, udpConn.LocalAddr().(*net.UDPAddr).Port, nil
 }
 
 func (s *StdNetBind) Open(uport uint16) ([]ReceiveFunc, uint16, error) {
@@ -207,14 +214,12 @@ again:
 	// that error used to close the already-open v4 socket — with BindUpdate
 	// having closed the old bind first, the device was left with no sockets
 	// at all. See bindFamilyUnavailable in lx_family_{default,windows}.go.
-	v4conn, port, err = listenNet(s.externalControl, "udp4", port)
+	v4conn, port, err = s.listenNet("udp4", port)
 	if err != nil && !bindFamilyUnavailable(err) {
 		return nil, 0, err
 	}
-	v4port := port // lx: SPEC 069 — survives the clobber below
-
-	// Listen on the same port as we're using for ipv4.
-	v6conn, port, err = listenNet(s.externalControl, "udp6", port)
+	// Listen on the IPv4 port, or on the requested port if IPv4 was unavailable.
+	v6conn, port, err = s.listenNet("udp6", port)
 	if uport == 0 && errors.Is(err, syscall.EADDRINUSE) && tries < 100 {
 		if v4conn != nil { // lx: SPEC 069 — v4 may have degraded away above
 			v4conn.Close()
@@ -229,11 +234,6 @@ again:
 			}
 			return nil, 0, err
 		}
-		// lx: SPEC 069 — the failed v6 listen returned (nil, 0, err) and the
-		// multi-assignment above clobbered the surviving v4 socket's port
-		// with that 0; restore it (latent upstream defect on the
-		// EAFNOSUPPORT degradation path too).
-		port = v4port
 	}
 	var fns []ReceiveFunc
 	if v4conn != nil {

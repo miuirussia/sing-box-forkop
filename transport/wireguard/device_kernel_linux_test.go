@@ -21,13 +21,16 @@ import (
 	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv6"
 	"github.com/sagernet/netlink"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/dialer"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/transport/phobos"
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/control"
+	"github.com/sagernet/sing/common/json/badoption"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/pause"
 	"github.com/vishvananda/netns"
@@ -106,7 +109,9 @@ func TestKernelWireGuardTunnel(t *testing.T) {
 		kind             string
 		phobos           *phobos.Options
 		amnezia          *AmneziaOptions
-		detour           bool
+		detourHost       string
+		blackholeFirst   bool
+		system           bool
 		multiDNS         bool
 		duplicateAddress bool
 	}{
@@ -114,8 +119,14 @@ func TestKernelWireGuardTunnel(t *testing.T) {
 		{name: "wireguard duplicate IPv4 address", kind: C.TypeWireGuard, duplicateAddress: true},
 		{name: "amneziawg", kind: C.TypeAmneziaWG, amnezia: amnezia},
 		{name: "amneziawg 3.1", kind: C.TypeAmneziaWG, amnezia: &amnezia31},
+		{name: "amneziawg system fallback recovers a silent detour", kind: C.TypeAmneziaWG, amnezia: amnezia, detourHost: "192.0.2.1", blackholeFirst: true, system: true},
 		{name: "phobos", kind: C.TypePhobos, phobos: obfuscation},
-		{name: "phobos detour", kind: C.TypePhobos, phobos: obfuscation, detour: true},
+		{name: "phobos detour", kind: C.TypePhobos, phobos: obfuscation, detourHost: "peer.test"},
+		{name: "phobos detour IP", kind: C.TypePhobos, phobos: obfuscation, detourHost: "192.0.2.1"},
+		{name: "phobos reconnects a silent detour", kind: C.TypePhobos, phobos: obfuscation, detourHost: "192.0.2.1", blackholeFirst: true},
+		{name: "wireguard system", system: true},
+		{name: "wireguard system fallback with detour", kind: C.TypeWireGuard, detourHost: "192.0.2.1", system: true},
+		{name: "phobos system with detour", phobos: obfuscation, detourHost: "192.0.2.1", system: true},
 		{name: "wireguard multi-address DNS", kind: C.TypeWireGuard, multiDNS: true},
 		{name: "phobos multi-address DNS", kind: C.TypePhobos, phobos: obfuscation, multiDNS: true},
 	} {
@@ -166,10 +177,27 @@ func TestKernelWireGuardTunnel(t *testing.T) {
 					AllowedIPs: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")},
 				}},
 			}
-			if test.detour {
-				clientOptions.Dialer = &proxyDialer{}
+			if test.detourHost != "" {
+				clientOptions.Dialer = &sessionProxy{blackholeFirst: test.blackholeFirst}
 				clientOptions.DialerOptions.Detour = "proxy"
 				clientOptions.ResolvePeer = nil
+				clientOptions.Peers[0].Endpoint = M.ParseSocksaddrHostPort(test.detourHost, serverPort)
+			}
+			if test.system {
+				finder := control.NewDefaultInterfaceFinder()
+				clientOptions.Context = service.ContextWith[adapter.NetworkManager](ctx, systemTestNetworkManager{finder: finder})
+				clientOptions.System = true
+				clientOptions.Address = []netip.Prefix{netip.MustParsePrefix("10.77.0.2/32")}
+				clientOptions.CreateDialer = func(name string) N.Dialer {
+					options := option.DialerOptions{AbstractDialerOptions: option.AbstractDialerOptions{
+						BindInterface: name, UDPFragmentDefault: true, ConnectTimeout: badoption.Duration(8 * time.Second),
+					}}
+					d, err := dialer.NewDefault(clientOptions.Context, options)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return d
+				}
 			}
 			if test.duplicateAddress {
 				firstOptions := clientOptions
@@ -191,7 +219,15 @@ func TestKernelWireGuardTunnel(t *testing.T) {
 					t.Fatalf("expected an error for an IPv4 address conflict in system mode, got %v", err)
 				}
 			}
-			client := startTestEndpoint(t, clientOptions, true)
+			client := startTestEndpoint(t, clientOptions, clientOptions.Peers[0].Endpoint.IsDomain())
+			if test.system {
+				if _, ok := client.tunDevice.(*systemStackDevice); !ok || client.UsesKernel() {
+					t.Fatal("expected a userspace system device")
+				}
+				testKernelEcho(t, client, server.tunDevice.(*stackDevice), serverAddresses[0].Addr())
+				testSystemRulesRemoved(t, client, clientOptions.Name)
+				return
+			}
 			if test.duplicateAddress {
 				if client.UsesKernel() {
 					t.Fatal("expected userspace fallback for a duplicate IPv4 address")
