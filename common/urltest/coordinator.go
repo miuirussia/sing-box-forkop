@@ -2,6 +2,7 @@ package urltest
 
 import (
 	"context"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,12 +16,12 @@ const (
 	coordinatorRetention     = 30 * time.Minute
 )
 
-// Coordinator collapses concurrent URL tests of the same outbound and lets
-// independent groups reuse a recent result instead of probing the same node
-// once per group and per interval.
+// Coordinator collapses concurrent probes of the same outbound and lets
+// independent groups reuse recent HTTP results.
 type Coordinator struct {
 	access    sync.Mutex
 	checks    map[coordinatorKey]*coordinatorCheck
+	udpChecks map[udpCoordinatorKey]*coordinatorCheck
 	lastPrune time.Time
 }
 
@@ -34,6 +35,13 @@ type coordinatorKey struct {
 	timeout        time.Duration
 }
 
+type udpCoordinatorKey struct {
+	tag      string
+	timeout  time.Duration
+	probe    UDPProbe
+	outbound N.Dialer
+}
+
 type coordinatorCheck struct {
 	done      chan struct{}
 	at        time.Time
@@ -45,6 +53,7 @@ type coordinatorCheck struct {
 func NewCoordinator() *Coordinator {
 	return &Coordinator{
 		checks:    make(map[coordinatorKey]*coordinatorCheck),
+		udpChecks: make(map[udpCoordinatorKey]*coordinatorCheck),
 		lastPrune: time.Now(),
 	}
 }
@@ -54,13 +63,33 @@ func NewCoordinator() *Coordinator {
 // force a fresh test. It returns the delay and the time the returned result was
 // produced, so callers can store an accurate history record.
 func (c *Coordinator) Check(ctx context.Context, link string, expectedStatus ExpectedStatus, tag string, detour N.Dialer, timeout time.Duration, maxAge time.Duration) (uint16, time.Time, error) {
+	key := coordinatorKey{tag: tag, link: link, expectedStatus: expectedStatusKey(expectedStatus), timeout: timeout}
+	return coordinate(ctx, c, c.checks, key, timeout, maxAge, true, func(testCtx context.Context) (uint16, error) {
+		return URLTestWithExpectedStatus(testCtx, link, detour, expectedStatus)
+	})
+}
+
+// CheckUDP joins an identical UDP probe in flight. Completed results remain
+// local to the group so that a failed UDP dial can invalidate its result.
+func (c *Coordinator) CheckUDP(ctx context.Context, probe *UDPProbe, tag string, detour N.Dialer, timeout time.Duration) (uint16, time.Time, error) {
+	if !reflect.ValueOf(detour).Comparable() {
+		delay, err := probe.Check(ctx, detour, timeout)
+		return delay, time.Now(), err
+	}
+	// Providers can replace an outbound while keeping its tag.
+	key := udpCoordinatorKey{tag: tag, timeout: timeout, probe: *probe, outbound: detour}
+	return coordinate(ctx, c, c.udpChecks, key, timeout, 0, false, func(testCtx context.Context) (uint16, error) {
+		return probe.check(testCtx, detour)
+	})
+}
+
+func coordinate[K comparable](ctx context.Context, c *Coordinator, checks map[K]*coordinatorCheck, key K, timeout time.Duration, maxAge time.Duration, retain bool, run func(context.Context) (uint16, error)) (uint16, time.Time, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, time.Now(), err
 	}
-	key := coordinatorKey{tag: tag, link: link, expectedStatus: expectedStatusKey(expectedStatus), timeout: timeout}
 	c.access.Lock()
 	for {
-		existing, loaded := c.checks[key]
+		existing, loaded := checks[key]
 		if !loaded {
 			break
 		}
@@ -86,7 +115,7 @@ func (c *Coordinator) Check(ctx context.Context, link string, expectedStatus Exp
 		break
 	}
 	check := &coordinatorCheck{done: make(chan struct{})}
-	c.checks[key] = check
+	checks[key] = check
 	c.pruneLocked()
 	c.access.Unlock()
 
@@ -97,7 +126,7 @@ func (c *Coordinator) Check(ctx context.Context, link string, expectedStatus Exp
 		testErr error
 	)
 	go func() {
-		delay, testErr = URLTestWithExpectedStatus(testCtx, link, detour, expectedStatus)
+		delay, testErr = run(testCtx)
 		close(testDone)
 	}()
 	select {
@@ -110,13 +139,15 @@ func (c *Coordinator) Check(ctx context.Context, link string, expectedStatus Exp
 	check.at = time.Now()
 	// A caller that walked away says nothing about the node.
 	check.abandoned = ctx.Err() != nil
-	close(check.done)
-	if check.abandoned {
+	if !retain || check.abandoned {
 		c.access.Lock()
-		if c.checks[key] == check {
-			delete(c.checks, key)
+		if checks[key] == check {
+			delete(checks, key)
 		}
+		close(check.done)
 		c.access.Unlock()
+	} else {
+		close(check.done)
 	}
 	return check.delay, check.at, check.err
 }

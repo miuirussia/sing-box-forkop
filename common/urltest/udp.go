@@ -32,8 +32,13 @@ func NewUDPProbe(server M.Socksaddr, domain string) (*UDPProbe, error) {
 }
 
 func (p *UDPProbe) Check(ctx context.Context, detour N.Dialer, timeout time.Duration) (uint16, error) {
-	ctx, cancel := context.WithTimeout(context.WithValue(ctx, contextKeyOutbound{}, detour), timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	return p.check(ctx, detour)
+}
+
+func (p *UDPProbe) check(ctx context.Context, detour N.Dialer) (uint16, error) {
+	ctx = context.WithValue(ctx, contextKeyOutbound{}, detour)
 	query := new(dns.Msg).SetQuestion(p.domain, dns.TypeA)
 	payload, err := query.Pack()
 	if err != nil {

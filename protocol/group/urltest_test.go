@@ -136,6 +136,137 @@ func TestURLTestChecksUDPIndependentlyOfTCP(t *testing.T) {
 	}
 }
 
+func TestURLTestPublishesHTTPWhileUDPIsStalled(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		udpStarted := make(chan struct{})
+		var firstUDP sync.Once
+		member := &udpProbeTestOutbound{
+			fallbackHealthTestOutbound: newFallbackHealthTestOutbound("exit", true),
+			beforeUDP: func(ctx context.Context, _ M.Socksaddr) error {
+				firstUDP.Do(func() { close(udpStarted) })
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		}
+		manager := &testOutboundManager{outbounds: map[string]adapter.Outbound{member.Tag(): member}}
+		group, err := NewURLTestGroup(ctx, manager, log.NewNOPFactory().NewLogger("test"),
+			[]adapter.Outbound{member}, "http://health.test/", nil, 0, 0, 0, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		enableTestUDPProbe(t, group)
+		group.PostStart()
+		<-udpStarted
+		synctest.Wait()
+		group.access.RLock()
+		selected := group.selectedOutboundTCP
+		group.access.RUnlock()
+		if selected != member {
+			t.Fatalf("scheduled check kept the TCP selection pending: %v", selected)
+		}
+		dialCtx, cancelDial := context.WithTimeout(ctx, time.Second)
+		defer cancelDial()
+		start := time.Now()
+		result, err := group.URLTest(dialCtx)
+		if _, ok := result[member.Tag()]; err != nil || !ok {
+			t.Fatalf("manual HTTP result = %v, %v", result, err)
+		}
+		if elapsed := time.Since(start); elapsed >= time.Second {
+			t.Fatalf("manual HTTP result waited for UDP: %v", elapsed)
+		}
+	})
+}
+
+func TestURLTestCloseCancelsDashboardUDPProbe(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		started := make(chan struct{})
+		stopped := make(chan struct{})
+		member := &udpProbeTestOutbound{
+			fallbackHealthTestOutbound: newFallbackHealthTestOutbound("exit", true),
+			beforeUDP: func(ctx context.Context, _ M.Socksaddr) error {
+				close(started)
+				<-ctx.Done()
+				close(stopped)
+				return ctx.Err()
+			},
+		}
+		manager := &testOutboundManager{outbounds: map[string]adapter.Outbound{member.Tag(): member}}
+		group, err := NewURLTestGroup(ctx, manager, log.NewNOPFactory().NewLogger("test"),
+			[]adapter.Outbound{member}, "http://health.test/", nil, 0, 0, 0, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		enableTestUDPProbe(t, group)
+		requestCtx, cancelRequest := context.WithCancel(ctx)
+		defer cancelRequest()
+		if _, err := group.URLTest(requestCtx); err != nil {
+			t.Fatal(err)
+		}
+		<-started
+		cancelRequest()
+		synctest.Wait()
+		select {
+		case <-stopped:
+			t.Fatal("dashboard UDP probe stopped when the request ended")
+		default:
+		}
+		if err := group.Close(); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		select {
+		case <-stopped:
+		default:
+			t.Fatal("dashboard UDP probe still running after group closed")
+		}
+	})
+}
+
+func TestURLTestFirstUDPConnectionJoinsScheduledProbe(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		started := make(chan struct{}, 2)
+		release := make(chan struct{})
+		member := &udpProbeTestOutbound{
+			fallbackHealthTestOutbound: newFallbackHealthTestOutbound("exit", true),
+			beforeUDP: func(ctx context.Context, _ M.Socksaddr) error {
+				started <- struct{}{}
+				select {
+				case <-release:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			},
+		}
+		manager := &testOutboundManager{outbounds: map[string]adapter.Outbound{member.Tag(): member}}
+		group, err := NewURLTestGroup(t.Context(), manager, log.NewNOPFactory().NewLogger("test"),
+			[]adapter.Outbound{member}, "http://health.test/", nil, 0, 0, 0, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		enableTestUDPProbe(t, group)
+		group.PostStart()
+		<-started
+		done := make(chan error, 1)
+		go func() {
+			_, err := group.selectForDial(t.Context(), N.NetworkUDP)
+			done <- err
+		}()
+		synctest.Wait()
+		close(release)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if duplicates := len(started); duplicates != 0 {
+			t.Fatalf("first connection started %d duplicate UDP probes", duplicates)
+		}
+	})
+}
+
 type splitURLTestOutbound struct {
 	*fallbackHistoryGroupOutbound
 	udp adapter.Outbound
@@ -262,35 +393,34 @@ func TestURLTestKeepsTheNewerUDPProbeResult(t *testing.T) {
 		t.Run(fmt.Sprintf("older_failed_%t", olderFailed), func(t *testing.T) {
 			started := make(chan struct{})
 			release := make(chan struct{})
-			var once sync.Once
 			member := &udpProbeTestOutbound{
 				fallbackHealthTestOutbound: newFallbackHealthTestOutbound("exit", true),
 				beforeUDP: func(ctx context.Context, _ M.Socksaddr) error {
-					older := false
-					once.Do(func() { older = true })
-					if older {
-						close(started)
-						select {
-						case <-release:
-						case <-ctx.Done():
-							return ctx.Err()
-						}
+					close(started)
+					select {
+					case <-release:
+					case <-ctx.Done():
+						return ctx.Err()
 					}
-					if older == olderFailed {
+					if olderFailed {
 						return errors.New("UDP unavailable")
 					}
 					return nil
 				},
+			}
+			replacement := &udpProbeTestOutbound{
+				fallbackHealthTestOutbound: newFallbackHealthTestOutbound("exit", true),
+				wrongReply:                 !olderFailed,
 			}
 			group := newDialTestURLTest(t, member).group
 			enableTestUDPProbe(t, group)
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				group.CheckOutbounds(t.Context(), false)
+				group.checkUDP(t.Context(), member.Tag(), member)
 			}()
 			<-started
-			group.CheckOutbounds(t.Context(), true)
+			group.checkUDP(t.Context(), replacement.Tag(), replacement)
 			_, tested := group.Select(N.NetworkUDP)
 			close(release)
 			<-done

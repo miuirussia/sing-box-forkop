@@ -182,6 +182,7 @@ func (e *Endpoint) Start(postStart bool) error {
 	if postStart != hasDomainPeer {
 		return nil
 	}
+	var kernelFallbackErr error
 	if e.options.KernelKind != "" {
 		kernel, err := startKernelDevice(e)
 		if err == nil {
@@ -193,9 +194,8 @@ func (e *Endpoint) Start(postStart bool) error {
 		if !errors.Is(err, errKernelUnavailable) {
 			return err
 		}
-		e.options.Logger.Info(err, ", using userspace")
-		err = e.createUserspaceDevice()
-		if err != nil {
+		kernelFallbackErr = err
+		if err := e.createUserspaceDevice(); err != nil {
 			return err
 		}
 	}
@@ -350,6 +350,13 @@ func (e *Endpoint) Start(postStart bool) error {
 	e.device = wgDevice
 	e.allowedIPs = wgDevice.AllowedIPs()
 	e.registerPause()
+	if kernelFallbackErr != nil {
+		mode := "userspace"
+		if e.options.System {
+			mode = "system TUN"
+		}
+		e.options.Logger.WarnContext(e.options.Context, "kernel mode requested, switched to ", mode, " (", kernelFallbackErr, ")")
+	}
 	return nil
 }
 

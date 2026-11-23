@@ -108,7 +108,8 @@ func (w *systemStackDevice) Start() error {
 
 func (w *systemStackDevice) Write(bufs [][]byte, offset int) (count int, err error) {
 	if w.batchDevice != nil {
-		writeBufs := make([][]byte, 0, len(bufs))
+		// Each WireGuard receiver owns its batch slice and reuses it from length zero.
+		writeBufs := bufs[:0]
 		for _, packet := range bufs {
 			if !w.writeStack(packet[offset:]) {
 				writeBufs = append(writeBufs, packet)

@@ -7,11 +7,13 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,6 +52,15 @@ func (kernelTestNetworkManager) ProtectFunc() control.Func        { return nil }
 func (kernelTestNetworkManager) AutoDetectInterface() bool        { return true }
 func (m kernelTestNetworkManager) AutoRedirectOutputMark() uint32 { return m.redirectMark }
 
+type kernelFallbackTestLogger struct {
+	logger.ContextLogger
+	warnings []string
+}
+
+func (l *kernelFallbackTestLogger) WarnContext(_ context.Context, args ...any) {
+	l.warnings = append(l.warnings, fmt.Sprint(args...))
+}
+
 func TestKernelWireGuardAutoDetectInterface(t *testing.T) {
 	for _, mark := range []uint32{0, 123} {
 		ctx := service.ContextWith[adapter.NetworkManager](context.Background(), kernelTestNetworkManager{redirectMark: mark})
@@ -66,9 +77,10 @@ func TestKernelWireGuardAutoDetectInterface(t *testing.T) {
 
 func TestKernelWireGuardFallback(t *testing.T) {
 	key, _ := testKeyPair(t)
+	log := &kernelFallbackTestLogger{ContextLogger: logger.NOP()}
 	endpoint := startTestEndpoint(t, EndpointOptions{
 		Context:    context.Background(),
-		Logger:     logger.NOP(),
+		Logger:     log,
 		KernelKind: C.TypeWireGuard,
 		DialerOptions: option.DialerOptions{
 			Detour: "proxy",
@@ -79,6 +91,10 @@ func TestKernelWireGuardFallback(t *testing.T) {
 	}, false)
 	if endpoint.UsesKernel() || endpoint.device == nil {
 		t.Fatal("expected userspace device for a WireGuard UDP detour")
+	}
+	if len(log.warnings) != 1 || !strings.Contains(log.warnings[0], "switched to userspace") ||
+		!strings.Contains(log.warnings[0], "outer UDP socket uses custom dialer options") {
+		t.Fatalf("expected a single userspace fallback warning with the cause, got %q", log.warnings)
 	}
 }
 
@@ -162,8 +178,9 @@ func TestKernelWireGuardTunnel(t *testing.T) {
 				PrivateKey: serverPrivate, ListenPort: serverPort, Phobos: test.phobos, Amnezia: test.amnezia,
 				Peers: []PeerOptions{{PublicKey: clientPublic, AllowedIPs: clientAddresses}},
 			}, false)
+			log := &kernelFallbackTestLogger{ContextLogger: logger.NOP()}
 			clientOptions := EndpointOptions{
-				Context: ctx, Logger: logger.NOP(), Dialer: listenDialer{}, Address: clientAddresses,
+				Context: ctx, Logger: log, Dialer: listenDialer{}, Address: clientAddresses,
 				PrivateKey: clientPrivate, KernelKind: test.kind, Name: "wg-test", Phobos: test.phobos, Amnezia: test.amnezia,
 				ResolvePeer: func(string) ([]netip.Addr, error) {
 					local := netip.MustParseAddr("127.0.0.1")
@@ -220,9 +237,18 @@ func TestKernelWireGuardTunnel(t *testing.T) {
 				}
 			}
 			client := startTestEndpoint(t, clientOptions, clientOptions.Peers[0].Endpoint.IsDomain())
+			if (test.kind == "" || client.UsesKernel()) && len(log.warnings) != 0 {
+				t.Fatalf("unexpected kernel fallback warning: %q", log.warnings)
+			}
+			if (test.duplicateAddress || test.multiDNS) && (len(log.warnings) != 1 || !strings.Contains(log.warnings[0], "switched to userspace")) {
+				t.Fatalf("expected a single userspace fallback warning, got %q", log.warnings)
+			}
 			if test.system {
 				if _, ok := client.tunDevice.(*systemStackDevice); !ok || client.UsesKernel() {
 					t.Fatal("expected a userspace system device")
+				}
+				if test.kind != "" && (len(log.warnings) != 1 || !strings.Contains(log.warnings[0], "switched to system TUN")) {
+					t.Fatalf("expected a single system TUN fallback warning, got %q", log.warnings)
 				}
 				testKernelEcho(t, client, server.tunDevice.(*stackDevice), serverAddresses[0].Addr())
 				testSystemRulesRemoved(t, client, clientOptions.Name)
