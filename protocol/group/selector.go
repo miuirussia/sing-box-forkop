@@ -277,7 +277,7 @@ func (s *Selector) DialContext(ctx context.Context, network string, destination 
 	if selected == nil {
 		return nil, E.New("no available outbounds")
 	}
-	conn, err := selected.DialContext(ctx, network, destination)
+	conn, err := dialGroupMember(ctx, selected, network, destination)
 	if err != nil {
 		return nil, err
 	}
@@ -289,7 +289,7 @@ func (s *Selector) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	if selected == nil {
 		return nil, E.New("no available outbounds")
 	}
-	conn, err := selected.ListenPacket(ctx, destination)
+	conn, err := listenPacketGroupMember(ctx, selected, destination)
 	if err != nil {
 		return nil, err
 	}

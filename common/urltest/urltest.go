@@ -63,6 +63,16 @@ func (s *HistoryStorage) DeleteURLTestHistory(tag string) {
 	s.access.Unlock()
 }
 
+// DeleteURLTestHistoryIfCurrent deletes the result if history is still stored for tag.
+func (s *HistoryStorage) DeleteURLTestHistoryIfCurrent(tag string, history *adapter.URLTestHistory) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	if history != nil && s.delayHistory[tag] == history {
+		delete(s.delayHistory, tag)
+		s.notifyUpdated()
+	}
+}
+
 func (s *HistoryStorage) StoreURLTestHistory(tag string, history *adapter.URLTestHistory) {
 	s.access.Lock()
 	s.delayHistory[tag] = history

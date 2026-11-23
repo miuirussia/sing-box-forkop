@@ -552,7 +552,7 @@ func (s *Fallback) DialContext(ctx context.Context, network string, destination 
 		conn = &fallbackEarlyConn{
 			Conn:        conn,
 			fallback:    s,
-			ctx:         connectionContext,
+			ctx:         withoutUDPDialHistory(connectionContext),
 			network:     network,
 			destination: destination,
 			candidate:   candidate,
@@ -577,7 +577,7 @@ func (s *Fallback) dialCandidates(ctx context.Context, network string, destinati
 			continue
 		}
 		attempt := s.newAttempt(ctx, len(candidates)-index)
-		conn, err := candidate.outbound.DialContext(attempt.ctx, network, destination)
+		conn, err := dialGroupMember(attempt.ctx, candidate.outbound, network, destination)
 		if err == nil {
 			if !N.NeedHandshakeForWrite(conn) {
 				attempt.keep()
@@ -660,7 +660,7 @@ func (s *Fallback) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 			continue
 		}
 		attempt := s.newAttempt(ctx, len(candidates)-index)
-		conn, err := candidate.outbound.ListenPacket(attempt.ctx, destination)
+		conn, err := listenPacketGroupMember(attempt.ctx, candidate.outbound, destination)
 		if err == nil {
 			attempt.keep()
 			s.recordDialSuccess(candidate)

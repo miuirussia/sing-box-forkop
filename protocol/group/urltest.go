@@ -220,6 +220,8 @@ func (s *URLTest) AttachConnection(closer io.Closer) func() {
 
 func (s *URLTest) AttachConnectionForNetwork(network string, closer io.Closer) func() {
 	s.group.Touch()
+	s.group.access.RLock()
+	defer s.group.access.RUnlock()
 	return s.group.connectionsForNetwork(network).Add(closer, true)
 }
 
@@ -279,20 +281,9 @@ func (s *URLTest) InterfaceUpdated(ctx context.Context) {
 }
 
 func (s *URLTest) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	s.group.Touch()
-	networkName := N.NetworkName(network)
-	outbound, err := s.group.selectForDial(ctx, networkName)
-	if err != nil {
-		return nil, err
-	}
-	conn, err := outbound.DialContext(ctx, network, destination)
-	if err == nil {
-		s.group.dialSucceeded()
-		return s.group.connectionsForNetwork(networkName).NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
-	}
-	s.group.deleteDialHistory(ctx, outbound, networkName)
-	s.group.dialFailed(ctx, outbound, err)
-	return nil, memberError(outbound, err)
+	return openURLTestConnection(ctx, s, N.NetworkName(network), func(ctx context.Context, outbound adapter.Outbound) (net.Conn, error) {
+		return dialGroupMember(ctx, outbound, network, destination)
+	}, (*interrupt.Group).NewConn)
 }
 
 // memberError names the member that failed: the caller logs the error with the outbound it
@@ -302,19 +293,158 @@ func memberError(member adapter.Outbound, err error) error {
 }
 
 func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	s.group.Touch()
-	outbound, err := s.group.selectForDial(ctx, N.NetworkUDP)
+	return openURLTestConnection(ctx, s, N.NetworkUDP, func(ctx context.Context, outbound adapter.Outbound) (net.PacketConn, error) {
+		return listenPacketGroupMember(ctx, outbound, destination)
+	}, (*interrupt.Group).NewPacketConn)
+}
+
+func openURLTestConnection[T io.Closer](ctx context.Context, urlTest *URLTest, network string, open func(context.Context, adapter.Outbound) (T, error), track func(*interrupt.Group, T, bool) T) (T, error) {
+	group := urlTest.group
+	group.Touch()
+	isExternal := interrupt.IsExternalConnectionFromContext(ctx)
+	probeUDP := network == N.NetworkUDP && group.udpHistory != nil
+	var parentHistory *udpDialHistory
+	if network == N.NetworkUDP {
+		parentHistory = udpDialHistoryFromContext(ctx)
+	}
+	var zero T
+	for {
+		var singleProbe [1]udpProbeSnapshot
+		var selectionProbes []udpProbeSnapshot
+		if parentHistory != nil {
+			// Selection can fail before a member is dialed. Capture the probe
+			// for the advertised exit before waiting for selection.
+			selectionProbes = parentHistory.snapshotProbes(RealTag(urlTest, network), singleProbe[:0])
+		}
+		selection, err := group.selectForDial(ctx, network)
+		if err != nil {
+			if len(selectionProbes) > 0 && ctx.Err() == nil && group.ctx.Err() == nil {
+				parentHistory.failedProbes = append(parentHistory.failedProbes, selectionProbes...)
+			}
+			return zero, err
+		}
+		dialContext := ctx
+		var dialHistory udpDialHistory
+		if probeUDP || parentHistory != nil {
+			dialHistory = udpDialHistory{storage: group.udpHistory, parent: parentHistory}
+			dialContext = context.WithValue(ctx, udpDialHistoryKey{}, &dialHistory)
+		}
+		conn, err := open(dialContext, selection.outbound)
+		failedProbes := dialHistory.failedProbes
+		dialHistory.failedProbes = nil
+		var failedTag string
+		if err != nil && !probeUDP {
+			failedTag = selection.outbound.Tag()
+		}
+		// Apply the dial result while the selection is still protected by the
+		// read lock.
+		group.access.RLock()
+		selected, generation := group.selectedOutboundTCP, group.tcpSwitchGeneration
+		if network == N.NetworkUDP {
+			selected, generation = group.selectedOutboundUDP, group.udpSwitchGeneration
+		}
+		if selection.selected != selected || selection.generation != generation {
+			group.access.RUnlock()
+			if err == nil {
+				conn.Close()
+			}
+			continue
+		}
+		if err == nil {
+			conn = track(group.connectionsForNetwork(network), conn, isExternal)
+			group.dialSucceeded()
+			group.access.RUnlock()
+			return conn, nil
+		}
+		if !probeUDP {
+			group.deleteHistory(failedTag)
+		}
+		dialHistory.reportFailures(ctx, failedProbes)
+		group.dialFailed(ctx, selection.outbound, err)
+		group.access.RUnlock()
+		return zero, memberError(selection.outbound, err)
+	}
+}
+
+type udpDialHistoryKey struct{}
+
+// A URLTest attempt collects failed probes for itself and its enclosing URLTests.
+// It reports them only if the attempt fails while the selection is current.
+type udpDialHistory struct {
+	storage      *urltest.HistoryStorage
+	parent       *udpDialHistory
+	failedProbes []udpProbeSnapshot
+}
+
+type udpProbeSnapshot struct {
+	owner  *udpDialHistory
+	tag    string
+	result *adapter.URLTestHistory
+}
+
+func (h *udpDialHistory) snapshotProbes(tag string, probes []udpProbeSnapshot) []udpProbeSnapshot {
+	for owner := h; owner != nil; owner = owner.parent {
+		if result := owner.storage.LoadURLTestHistory(tag); result != nil {
+			probes = append(probes, udpProbeSnapshot{owner: owner, tag: tag, result: result})
+		}
+	}
+	return probes
+}
+
+func (h *udpDialHistory) reportFailures(ctx context.Context, probes []udpProbeSnapshot) {
+	canceled := ctx.Err() != nil
+	for _, probe := range probes {
+		if probe.owner != h {
+			h.parent.failedProbes = append(h.parent.failedProbes, probe)
+		} else if !canceled {
+			h.storage.DeleteURLTestHistoryIfCurrent(probe.tag, probe.result)
+		}
+	}
+}
+
+func udpDialHistoryFromContext(ctx context.Context) *udpDialHistory {
+	history, _ := ctx.Value(udpDialHistoryKey{}).(*udpDialHistory)
+	return history
+}
+
+func withoutUDPDialHistory(ctx context.Context) context.Context {
+	if udpDialHistoryFromContext(ctx) == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, udpDialHistoryKey{}, (*udpDialHistory)(nil))
+}
+
+func dialGroupMember(ctx context.Context, member adapter.Outbound, network string, destination M.Socksaddr) (net.Conn, error) {
+	return openGroupMember(ctx, network, member, func(ctx context.Context) (net.Conn, error) {
+		return member.DialContext(ctx, network, destination)
+	})
+}
+
+func listenPacketGroupMember(ctx context.Context, member adapter.Outbound, destination M.Socksaddr) (net.PacketConn, error) {
+	return openGroupMember(ctx, N.NetworkUDP, member, func(ctx context.Context) (net.PacketConn, error) {
+		return member.ListenPacket(ctx, destination)
+	})
+}
+
+func openGroupMember[T io.Closer](ctx context.Context, network string, member adapter.Outbound, open func(context.Context) (T, error)) (T, error) {
+	if N.NetworkName(network) != N.NetworkUDP {
+		return open(ctx)
+	}
+	history := udpDialHistoryFromContext(ctx)
+	if history == nil {
+		return open(ctx)
+	}
+	if _, isGroup := member.(adapter.OutboundGroup); isGroup {
+		return open(ctx)
+	}
+	var singleProbe [1]udpProbeSnapshot
+	probes := history.snapshotProbes(member.Tag(), singleProbe[:0])
+	// A concrete member's detours use their own history.
+	conn, err := open(withoutUDPDialHistory(ctx))
 	if err != nil {
-		return nil, err
+		history.failedProbes = append(history.failedProbes, probes...)
 	}
-	conn, err := outbound.ListenPacket(ctx, destination)
-	if err == nil {
-		s.group.dialSucceeded()
-		return s.group.connectionsForNetwork(N.NetworkUDP).NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
-	}
-	s.group.deleteDialHistory(ctx, outbound, N.NetworkUDP)
-	s.group.dialFailed(ctx, outbound, err)
-	return nil, memberError(outbound, err)
+	return conn, err
 }
 
 func (s *URLTest) onProviderUpdated(tag string) error {
@@ -410,6 +540,8 @@ type URLTestGroup struct {
 	refreshingUDP                atomic.Bool
 	selectedOutboundTCP          adapter.Outbound
 	selectedOutboundUDP          adapter.Outbound
+	tcpSwitchGeneration          uint64
+	udpSwitchGeneration          uint64
 	initialTCPReady              bool
 	initialUDPReady              bool
 	initialTCPCheckDone          chan struct{}
@@ -479,11 +611,18 @@ func (g *URLTestGroup) setUDPProbe(probe *urltest.UDPProbe) {
 	g.udpInterruptGroup = interrupt.NewGroup()
 }
 
+// connectionsForNetwork requires g.access to be held.
 func (g *URLTestGroup) connectionsForNetwork(network string) *interrupt.Group {
 	if network == N.NetworkUDP && g.udpInterruptGroup != nil {
 		return g.udpInterruptGroup
 	}
 	return g.interruptGroup
+}
+
+type urlTestDialSelection struct {
+	outbound   adapter.Outbound
+	selected   adapter.Outbound // May differ from outbound when bootstrapping DNS for a probe.
+	generation uint64
 }
 
 // freshFor is how long a scheduled check takes a result as current: half an interval keeps a tick
@@ -496,16 +635,6 @@ func freshFor(interval time.Duration) time.Duration {
 func (g *URLTestGroup) deleteHistory(tag string) {
 	g.history.DeleteURLTestHistory(tag)
 	g.sharedHistory.DeleteURLTestHistory(tag)
-}
-
-func (g *URLTestGroup) deleteDialHistory(ctx context.Context, detour adapter.Outbound, network string) {
-	if network == N.NetworkUDP && g.udpHistory != nil {
-		if ctx.Err() == nil {
-			g.udpHistory.DeleteURLTestHistory(RealTag(detour, network))
-		}
-		return
-	}
-	g.deleteHistory(detour.Tag())
 }
 
 func (g *URLTestGroup) storeHistory(tag string, history *adapter.URLTestHistory) {
@@ -523,7 +652,7 @@ func (g *URLTestGroup) notifyHistoryChangedLocked() {
 
 // The first dial needs a tested member. Wake on each successful probe so a
 // tunnel does not wait for the slowest member of the initial batch.
-func (g *URLTestGroup) selectForDial(ctx context.Context, network string) (adapter.Outbound, error) {
+func (g *URLTestGroup) selectForDial(ctx context.Context, network string) (urlTestDialSelection, error) {
 	dnsTransportTag, _ := adapter.DNSTransportTagFromContext(ctx)
 	requiresUDPProbe := network == N.NetworkUDP && g.udpHistory != nil
 	initialCheckDone := &g.initialTCPCheckDone
@@ -534,36 +663,46 @@ func (g *URLTestGroup) selectForDial(ctx context.Context, network string) (adapt
 	finished := false
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return urlTestDialSelection{}, err
 		}
 		g.access.Lock()
-		selected, ready := &g.selectedOutboundTCP, &g.initialTCPReady
+		selected, ready, generation := &g.selectedOutboundTCP, &g.initialTCPReady, &g.tcpSwitchGeneration
 		switch network {
 		case N.NetworkTCP:
 		case N.NetworkUDP:
-			selected, ready = &g.selectedOutboundUDP, &g.initialUDPReady
+			selected, ready, generation = &g.selectedOutboundUDP, &g.initialUDPReady, &g.udpSwitchGeneration
 		default:
 			g.access.Unlock()
-			return nil, E.Extend(N.ErrUnknownNetwork, network)
+			return urlTestDialSelection{}, E.Extend(N.ErrUnknownNetwork, network)
+		}
+		selection := func(outbound adapter.Outbound) urlTestDialSelection {
+			return urlTestDialSelection{outbound: outbound, selected: *selected, generation: *generation}
 		}
 		if *ready && *selected != nil && (!requiresUDPProbe || g.udpHistory.LoadURLTestHistory(RealTag(*selected, network)) != nil) {
-			outbound := *selected
+			picked := selection(*selected)
 			g.access.Unlock()
-			return outbound, nil
+			return picked, nil
 		}
 		outbound, tested := g.selectOutbound(network)
 		if outbound == nil {
 			g.access.Unlock()
-			return nil, E.New("missing supported outbound")
+			return urlTestDialSelection{}, E.New("missing supported outbound")
 		}
 		if tested || (*ready && !requiresUDPProbe) {
 			udpChanged := requiresUDPProbe && *selected != nil && (*selected).Tag() != outbound.Tag()
 			*selected, *ready = outbound, true
-			g.access.Unlock()
+			var previous *interrupt.Group
 			if udpChanged {
-				g.udpInterruptGroup.Interrupt(g.interruptExternalConnections)
+				g.udpSwitchGeneration++
+				previous = g.udpInterruptGroup
+				g.udpInterruptGroup = interrupt.NewGroup()
 			}
-			return outbound, nil
+			picked := selection(outbound)
+			g.access.Unlock()
+			if previous != nil {
+				previous.Interrupt(g.interruptExternalConnections)
+			}
+			return picked, nil
 		}
 		if probe := urltest.OutboundFromContext(ctx); probe != nil && dnsTransportTag != "" {
 			// DNS for a probe may detour back through this group. Prefer the
@@ -574,15 +713,16 @@ func (g *URLTestGroup) selectForDial(ctx context.Context, network string) (adapt
 					break
 				}
 			}
+			picked := selection(outbound)
 			g.access.Unlock()
-			return outbound, nil
+			return picked, nil
 		}
 		if finished {
 			g.access.Unlock()
 			if requiresUDPProbe {
-				return nil, E.New("no outbound passed the UDP probe")
+				return urlTestDialSelection{}, E.New("no outbound passed the UDP probe")
 			}
-			return nil, E.New("no outbound passed the initial URL test for ", network)
+			return urlTestDialSelection{}, E.New("no outbound passed the initial URL test for ", network)
 		}
 		if checkDone == nil {
 			if *initialCheckDone == nil {
@@ -609,9 +749,9 @@ func (g *URLTestGroup) selectForDial(ctx context.Context, network string) (adapt
 		case <-checkDone:
 			finished = true
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return urlTestDialSelection{}, ctx.Err()
 		case <-g.ctx.Done():
-			return nil, g.ctx.Err()
+			return urlTestDialSelection{}, g.ctx.Err()
 		}
 	}
 }
@@ -1058,12 +1198,30 @@ func (g *URLTestGroup) updateSelection(tcp, udp bool) {
 			selected = true
 		}
 	}
-	g.access.Unlock()
+	// Track switches per network even when both networks share an interrupt group.
+	if tcpChanged {
+		g.tcpSwitchGeneration++
+	}
+	if udpChanged {
+		g.udpSwitchGeneration++
+	}
+	// Publish the new connection groups with the selection. Closing old
+	// connections can block, so interrupt them after releasing the lock.
+	var previous, previousUDP *interrupt.Group
 	if tcpChanged || (udpChanged && g.udpInterruptGroup == nil) {
-		g.interruptGroup.Interrupt(g.interruptExternalConnections)
+		previous = g.interruptGroup
+		g.interruptGroup = interrupt.NewGroup()
 	}
 	if udpChanged && g.udpInterruptGroup != nil {
-		g.udpInterruptGroup.Interrupt(g.interruptExternalConnections)
+		previousUDP = g.udpInterruptGroup
+		g.udpInterruptGroup = interrupt.NewGroup()
+	}
+	g.access.Unlock()
+	if previous != nil {
+		previous.Interrupt(g.interruptExternalConnections)
+	}
+	if previousUDP != nil {
+		previousUDP.Interrupt(g.interruptExternalConnections)
 	}
 	if selected {
 		g.history.NotifyUpdated()
