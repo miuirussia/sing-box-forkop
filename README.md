@@ -38,7 +38,7 @@ Clash API и uTLS есть во всех вариантах. `full` с NaiveProx
 
 ## Геоданные V2Ray/Xray
 
-`geodata` читает DAT потоком и экспортирует один тег прямо в SRS. Команды `geosite` и `geoip` работают с форматом `.db`.
+`geodata` читает DAT потоком и экспортирует теги прямо в SRS. Команды `geosite` и `geoip` работают с форматом `.db`.
 
 ```sh
 sing-box geodata fetch --url URL --output geosite.dat
@@ -46,9 +46,16 @@ sing-box geodata list --kind geosite --file geosite.dat --output index.json
 sing-box geodata tags --index index.json --search youtube --offset 0
 sing-box geodata export --kind geosite --file geosite.dat --index index.json --tag youtube --output youtube.srs
 sing-box geodata export --kind geoip --file geoip.dat --tag ru --output ru.srs
+printf '%s\n' '["youtube", "google@!cn"]' > tags.json
+mkdir -p rulesets
+sing-box geodata export --kind geosite --file geosite.dat --index index.json --tags-file tags.json --output rulesets
 ```
 
-Индекс привязан к размеру и времени изменения DAT. Поиск выдаёт до 200 тегов на страницу. Для geosite можно указать тег с фильтром по атрибуту, например `--tag 'google@!cn'`. Экспорт сохраняет типы доменов и IPv4/IPv6 CIDR, включая `/0`. Для GeoIP поддерживаются только прямые совпадения (`inverse_match: false`). При ошибке экспорта существующий SRS остаётся на месте.
+Индекс привязан к размеру и времени изменения DAT. Поиск выдаёт до 200 тегов на страницу. Для geosite можно указать тег с фильтром по атрибуту, например `--tag 'google@!cn'`. Экспорт сохраняет типы доменов и IPv4/IPv6 CIDR, включая `/0`. Для GeoIP поддерживаются только прямые совпадения (`inverse_match: false`).
+
+Пакетный экспорт принимает JSON-массив тегов, читает индекс один раз и последовательно записывает `<тег>.srs` в существующий каталог `--output`. Каждый файл заменяется атомарно после успешной компиляции. При ошибке команда останавливается, а уже записанные файлы остаются в каталоге.
+
+Файл списка тегов ограничен 16 МиБ и 32 768 уникальными тегами с учётом фильтров по атрибутам.
 
 Лимит `fetch` составляет 128 МиБ, тайм-аут 10 минут. Загрузку через выбранный outbound выполняет локальный `POST /geodata/download` Clash API с авторизацией.
 

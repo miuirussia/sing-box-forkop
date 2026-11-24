@@ -29,7 +29,7 @@ type Catalog struct {
 	Mtime    string  `json:"mtime"`
 	SHA256   string  `json:"sha256"`
 	TagCount int     `json:"tag_count"`
-	Tags     []Entry `json:"tags"`
+	Tags     []Entry `json:"tags"` // Sorted by name by Index and LoadTagCatalogs.
 }
 
 func ValidKind(kind string) bool { return kind == "geosite" || kind == "geoip" }

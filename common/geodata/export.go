@@ -1,6 +1,7 @@
 package geodata
 
 import (
+	"cmp"
 	"fmt"
 	"io"
 	"net/netip"
@@ -16,9 +17,20 @@ import (
 	"go4.org/netipx"
 )
 
+const srsCompressionLevel = 3
+
 // Export writes exactly one tag. SRS compilation never holds unrelated tags,
 // a decoded protobuf tree, a JSON copy, or a slice of printable CIDR strings.
 func Export(path string, catalog *Catalog, tag string, output io.Writer) error {
+	return export(path, catalog, tag, output, false)
+}
+
+// ExportIndexed exports a tag from the sorted catalog returned by Index or LoadTagCatalogs.
+func (catalog *Catalog) ExportIndexed(path, tag string, output io.Writer) error {
+	return export(path, catalog, tag, output, true)
+}
+
+func export(path string, catalog *Catalog, tag string, output io.Writer, sorted bool) error {
 	tag, err := NormalizeTag(tag)
 	if err != nil {
 		return err
@@ -27,16 +39,22 @@ func Export(path string, catalog *Catalog, tag string, output io.Writer) error {
 	if catalog.Kind == "geoip" && attribute != "" {
 		return fmt.Errorf("geoip does not support attribute filters")
 	}
-	var entry *Entry
-	for i := range catalog.Tags {
-		if catalog.Tags[i].Name == base {
-			entry = &catalog.Tags[i]
-			break
+	var index int
+	if sorted {
+		var found bool
+		index, found = slices.BinarySearchFunc(catalog.Tags, base, func(entry Entry, name string) int {
+			return cmp.Compare(entry.Name, name)
+		})
+		if !found {
+			index = -1
 		}
+	} else {
+		index = slices.IndexFunc(catalog.Tags, func(entry Entry) bool { return entry.Name == base })
 	}
-	if entry == nil {
+	if index < 0 {
 		return fmt.Errorf("%s tag %q not found", catalog.Kind, base)
 	}
+	entry := catalog.Tags[index]
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -107,7 +125,12 @@ func Export(path string, catalog *Catalog, tag string, output io.Writer) error {
 		rule.DomainKeyword = unique(rule.DomainKeyword)
 		rule.DomainRegex = unique(rule.DomainRegex)
 	}
-	return srs.Write(output, option.PlainRuleSet{Rules: []option.HeadlessRule{{Type: C.RuleTypeDefault, DefaultOptions: rule}}}, C.RuleSetVersion2)
+	return srs.WriteWithCompression(
+		output,
+		option.PlainRuleSet{Rules: []option.HeadlessRule{{Type: C.RuleTypeDefault, DefaultOptions: rule}}},
+		C.RuleSetVersion2,
+		srsCompressionLevel,
+	)
 }
 
 func unique(values []string) []string {

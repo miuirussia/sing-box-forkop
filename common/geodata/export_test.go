@@ -2,6 +2,7 @@ package geodata
 
 import (
 	"bytes"
+	"slices"
 	"testing"
 
 	"github.com/sagernet/sing-box/common/srs"
@@ -83,6 +84,31 @@ func TestExportGeoIP(t *testing.T) {
 	zero := exportRule(t, "geoip", geoEntry("all", message(1, []byte{0, 0, 0, 0})), "all")
 	if len(zero.IPCIDR) != 1 || zero.IPCIDR[0] != "0.0.0.0/0" {
 		t.Fatalf("lost /0: %v", zero.IPCIDR)
+	}
+}
+
+func TestExportUnsortedCatalog(t *testing.T) {
+	t.Parallel()
+	data := append(
+		geoEntry("first", domainItem(3, "first.example", "")),
+		geoEntry("second", domainItem(3, "second.example", ""))...,
+	)
+	path := database(t, data)
+	catalog, err := Index(path, "geosite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Reverse(catalog.Tags)
+	var output bytes.Buffer
+	if err = Export(path, catalog, "first", &output); err != nil {
+		t.Fatal(err)
+	}
+	rules, err := srs.Read(bytes.NewReader(output.Bytes()), true)
+	if err != nil || len(rules.Options.Rules) != 1 {
+		t.Fatalf("invalid SRS: %v", err)
+	}
+	if got := rules.Options.Rules[0].DefaultOptions.Domain; !slices.Equal(got, []string{"first.example"}) {
+		t.Fatalf("got domains %v, want first.example", got)
 	}
 }
 

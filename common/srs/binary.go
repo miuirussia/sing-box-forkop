@@ -91,6 +91,10 @@ func Read(reader io.Reader, recover bool) (ruleSetCompat option.PlainRuleSetComp
 }
 
 func Write(writer io.Writer, ruleSet option.PlainRuleSet, generateVersion uint8) error {
+	return WriteWithCompression(writer, ruleSet, generateVersion, zlib.BestCompression)
+}
+
+func WriteWithCompression(writer io.Writer, ruleSet option.PlainRuleSet, generateVersion uint8, level int) error {
 	_, err := writer.Write(MagicBytes[:])
 	if err != nil {
 		return err
@@ -99,7 +103,7 @@ func Write(writer io.Writer, ruleSet option.PlainRuleSet, generateVersion uint8)
 	if err != nil {
 		return err
 	}
-	compressWriter, err := zlib.NewWriterLevel(writer, zlib.BestCompression)
+	compressWriter, err := zlib.NewWriterLevel(writer, level)
 	if err != nil {
 		return err
 	}

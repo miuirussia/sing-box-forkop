@@ -1,10 +1,12 @@
 package geodata
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 )
 
@@ -80,15 +82,36 @@ func scanCatalog(path string, visit func(Entry)) (*Catalog, error) {
 }
 
 func LoadTagCatalog(path, indexPath, kind, tag string) (*Catalog, error) {
-	tag, err := NormalizeTag(tag)
-	if err != nil {
-		return nil, err
+	return LoadTagCatalogs(
+		path,
+		indexPath,
+		kind,
+		[]string{tag},
+	)
+}
+
+// LoadTagCatalogs scans the index once and retains only the requested base tags.
+func LoadTagCatalogs(path, indexPath, kind string, tags []string) (*Catalog, error) {
+	entries := make(map[string]Entry, len(tags))
+	bases := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		normalized, err := NormalizeTag(tag)
+		if err != nil {
+			return nil, err
+		}
+		base, _, _ := strings.Cut(normalized, "@")
+		if _, exists := entries[base]; !exists {
+			bases = append(bases, base)
+			entries[base] = Entry{}
+		}
 	}
-	base, _, _ := strings.Cut(tag, "@")
-	var entries []Entry
+	var duplicate string
 	catalog, err := scanCatalog(indexPath, func(entry Entry) {
-		if entry.Name == base {
-			entries = append(entries, entry)
+		if selected, ok := entries[entry.Name]; ok {
+			if selected.Name != "" {
+				duplicate = entry.Name
+			}
+			entries[entry.Name] = entry
 		}
 	})
 	if err != nil {
@@ -101,10 +124,19 @@ func LoadTagCatalog(path, indexPath, kind, tag string) (*Catalog, error) {
 	if catalog.Kind != kind || catalog.Size != st.Size() || catalog.Mtime != fmt.Sprint(st.ModTime().UnixNano()) {
 		return nil, fmt.Errorf("stale geodata index")
 	}
-	if len(entries) != 1 || entries[0].Offset < 0 || entries[0].Length < 0 || entries[0].Offset > st.Size() || entries[0].Length > st.Size()-entries[0].Offset {
-		return nil, fmt.Errorf("tag %q not found or invalid geodata index bounds", tag)
+	if duplicate != "" {
+		return nil, fmt.Errorf("duplicate geodata index entry for tag %q", duplicate)
 	}
-	catalog.Tags = entries
+	catalog.Tags = make([]Entry, 0, len(entries))
+	for _, tag := range bases {
+		entry := entries[tag]
+		invalidOffset := entry.Offset < 0 || entry.Offset > st.Size()
+		if entry.Name == "" || invalidOffset || entry.Length < 0 || entry.Length > st.Size()-entry.Offset {
+			return nil, fmt.Errorf("tag %q not found or invalid geodata index bounds", tag)
+		}
+		catalog.Tags = append(catalog.Tags, entry)
+	}
+	slices.SortFunc(catalog.Tags, func(a, b Entry) int { return cmp.Compare(a.Name, b.Name) })
 	return catalog, nil
 }
 

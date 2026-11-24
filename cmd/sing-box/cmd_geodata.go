@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,11 @@ import (
 	"github.com/sagernet/sing-box/common/geodata"
 
 	"github.com/spf13/cobra"
+)
+
+const (
+	maxGeodataTagsBytes = 16 << 20
+	maxGeodataTags      = 32768
 )
 
 func init() { mainCommand.AddCommand(newGeodataCommand()) }
@@ -51,28 +57,59 @@ func newGeodataCommand() *cobra.Command {
 		}
 		return nil
 	}
-	var tag, indexPath, output string
+	var tag, tagsPath, indexPath, output string
 	export := &cobra.Command{
-		Use: "export", Short: "Compile one DAT tag directly to SRS", Args: cobra.NoArgs,
+		Use: "export", Short: "Compile DAT tags directly to SRS", Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			requested := []string{tag}
+			batch := cmd.Flags().Changed("tags-file")
+			if batch {
+				if output == "" {
+					return fmt.Errorf("--output must name the batch output directory")
+				}
+				var err error
+				requested, err = readGeodataTags(tagsPath)
+				if err != nil {
+					return err
+				}
+			}
 			var catalog *geodata.Catalog
 			var err error
 			if indexPath == "" {
 				catalog, err = geodata.Index(path, kind)
 			} else {
-				catalog, err = geodata.LoadTagCatalog(path, indexPath, kind, tag)
+				catalog, err = geodata.LoadTagCatalogs(
+					path,
+					indexPath,
+					kind,
+					requested,
+				)
 			}
 			if err != nil {
 				return err
 			}
-			return writeGeodataFile(output, func(w io.Writer) error { return geodata.Export(path, catalog, tag, w) })
+			for _, tag := range requested {
+				destination := output
+				if batch {
+					destination = filepath.Join(output, tag+".srs")
+				}
+				err = writeGeodataFile(destination, func(w io.Writer) error {
+					return catalog.ExportIndexed(path, tag, w)
+				})
+				if err != nil {
+					return fmt.Errorf("export geodata tag %q: %w", tag, err)
+				}
+			}
+			return nil
 		},
 	}
 	export.Flags().StringVar(&tag, "tag", "", "Tag, optionally with @attribute or @!attribute")
+	export.Flags().StringVar(&tagsPath, "tags-file", "", "JSON array of tags to export in one batch")
 	export.PreRunE = list.PreRunE
 	export.Flags().StringVar(&indexPath, "index", "", "Reuse an index produced by geodata list")
-	export.Flags().StringVarP(&output, "output", "o", "", "Output SRS file")
-	_ = export.MarkFlagRequired("tag")
+	export.Flags().StringVarP(&output, "output", "o", "", "Output SRS file or directory when using --tags-file")
+	export.MarkFlagsOneRequired("tag", "tags-file")
+	export.MarkFlagsMutuallyExclusive("tag", "tags-file")
 	_ = export.MarkFlagRequired("output")
 	command.AddCommand(list, export)
 	var address, destination string
@@ -115,6 +152,71 @@ func newGeodataCommand() *cobra.Command {
 	_ = tags.MarkFlagRequired("index")
 	command.AddCommand(tags)
 	return command
+}
+
+func readGeodataTags(path string) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode().IsRegular() && info.Size() > maxGeodataTagsBytes {
+		return nil, fmt.Errorf("geodata tags file exceeds 16 MiB")
+	}
+	reader := &io.LimitedReader{R: file, N: maxGeodataTagsBytes + 1}
+	tags, err := decodeGeodataTags(reader)
+	if reader.N == 0 {
+		return nil, fmt.Errorf("geodata tags file exceeds 16 MiB")
+	}
+	return tags, err
+}
+
+func decodeGeodataTags(reader io.Reader) ([]string, error) {
+	decoder := json.NewDecoder(reader)
+	opening, err := decoder.Token()
+	if err != nil {
+		return nil, fmt.Errorf("read geodata tags: %w", err)
+	}
+	if opening != json.Delim('[') {
+		return nil, fmt.Errorf("geodata tags file must contain a JSON array")
+	}
+	tags := []string{}
+	seen := make(map[string]bool)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return nil, fmt.Errorf("read geodata tags: %w", err)
+		}
+		tag, ok := token.(string)
+		if !ok {
+			return nil, fmt.Errorf("geodata tags must be JSON strings")
+		}
+		tag, err = geodata.NormalizeTag(tag)
+		if err != nil {
+			return nil, err
+		}
+		if !seen[tag] {
+			if len(tags) == maxGeodataTags {
+				return nil, fmt.Errorf("too many distinct geodata tags (maximum %d)", maxGeodataTags)
+			}
+			seen[tag] = true
+			tags = append(tags, tag)
+		}
+	}
+	if _, err = decoder.Token(); err != nil {
+		return nil, fmt.Errorf("read geodata tags: %w", err)
+	}
+	if _, err = decoder.Token(); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("unexpected data after geodata tags array")
+	}
+	if len(tags) == 0 {
+		return nil, fmt.Errorf("geodata tags file must contain at least one tag")
+	}
+	return tags, nil
 }
 
 func writeGeodataFile(path string, write func(io.Writer) error) error {
