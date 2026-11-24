@@ -33,7 +33,7 @@ type LocalRuleSet struct {
 	access       sync.RWMutex
 	rules        []adapter.HeadlessRule
 	metadata     adapter.RuleSetMetadata
-	ipCIDRExport adapter.RuleSetIPCIDRExport
+	ipCIDRExport *ruleSetIPCIDRExport
 	updatedAt    time.Time
 	revision     uint64
 	// fileFormat is the configured format, which stays auto across reloads, while
@@ -132,7 +132,7 @@ func (s *LocalRuleSet) reloadRules(headlessRules []option.HeadlessRule, contentF
 	if err != nil {
 		return err
 	}
-	ipCIDRExport := emptyRuleSetIPCIDRExport()
+	ipCIDRExport := emptyRuleSetIPCIDRExport
 	if metadata.ContainsIPCIDRRule {
 		ipCIDRExport = buildRuleSetIPCIDRExport(headlessRules)
 	}
@@ -159,14 +159,22 @@ func (s *LocalRuleSet) Metadata() adapter.RuleSetMetadata {
 
 func (s *LocalRuleSet) ProviderSnapshot() adapter.RuleSetProviderSnapshot {
 	s.access.RLock()
-	defer s.access.RUnlock()
-	return adapter.RuleSetProviderSnapshot{
+	snapshot := adapter.RuleSetProviderSnapshot{
 		Type:      s.providerType,
 		Format:    s.contentFormat,
 		UpdatedAt: s.updatedAt,
 		Revision:  s.revision,
-		IPCIDR:    s.ipCIDRExport,
 	}
+	export := s.ipCIDRExport
+	s.access.RUnlock()
+	snapshot.IPCIDR = export.snapshot()
+	return snapshot
+}
+
+func (s *LocalRuleSet) ProviderRevision() uint64 {
+	s.access.RLock()
+	defer s.access.RUnlock()
+	return s.revision
 }
 
 func (s *LocalRuleSet) ExtractIPSet() []*netipx.IPSet {

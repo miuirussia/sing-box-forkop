@@ -164,6 +164,10 @@ func ruleProviderVehicleType(providerType string) string {
 func ruleProviderRevision(ruleSets []adapter.RuleSet) uint64 {
 	var revision uint64
 	for _, ruleSet := range ruleSets {
+		if provider, loaded := ruleSet.(interface{ ProviderRevision() uint64 }); loaded {
+			revision += provider.ProviderRevision()
+			continue
+		}
 		if provider, loaded := ruleSet.(adapter.RuleSetProvider); loaded {
 			revision += provider.ProviderSnapshot().Revision
 		}

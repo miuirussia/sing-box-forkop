@@ -97,7 +97,7 @@ func TestRuleSetIPCIDRExport(t *testing.T) {
 		},
 	}
 
-	exported := buildRuleSetIPCIDRExport(rules)
+	exported := buildRuleSetIPCIDRExport(rules).snapshot()
 	require.Equal(t, []string{"10.0.0.0/8", "192.168.0.0/16", "198.51.100.0/24"}, exported.IPv4)
 	require.Equal(t, []string{"2001:db8::/32"}, exported.IPv6)
 	require.Equal(t, []adapter.RuleSetIPCIDRScoped{
@@ -147,7 +147,7 @@ func TestRuleSetIPCIDRExport(t *testing.T) {
 
 	textRules, err := plain.ToOptions(strings.NewReader("text.example\n100.64.0.0/10\n2001:db8:1::1\n"))
 	require.NoError(t, err)
-	textExport := buildRuleSetIPCIDRExport(textRules)
+	textExport := buildRuleSetIPCIDRExport(textRules).snapshot()
 	require.Equal(t, []string{"100.64.0.0/10"}, textExport.IPv4)
 	require.Equal(t, []string{"2001:db8:1::1/128"}, textExport.IPv6)
 }
@@ -167,9 +167,9 @@ func TestRuleSetIPCIDRExportSkipsDomainOnlyRulesWithoutPerRuleAllocations(t *tes
 			panic("domain-only rule-set produced an nft export")
 		}
 	}
-	assertEmpty(buildRuleSetIPCIDRExport(rules))
+	assertEmpty(buildRuleSetIPCIDRExport(rules).snapshot())
 	allocations := testing.AllocsPerRun(5, func() {
-		assertEmpty(buildRuleSetIPCIDRExport(rules))
+		assertEmpty(buildRuleSetIPCIDRExport(rules).snapshot())
 	})
 	require.Less(t, allocations, float64(100), "domain-only rule count must not drive exporter allocations")
 }
@@ -177,7 +177,7 @@ func TestRuleSetIPCIDRExportSkipsDomainOnlyRulesWithoutPerRuleAllocations(t *tes
 // A rule-set without IP rules is exported as empty lists rather than nulls, so
 // a consumer can always iterate the snapshot.
 func TestRuleSetIPCIDREmptyExportIsIterable(t *testing.T) {
-	exported := emptyRuleSetIPCIDRExport()
+	exported := emptyRuleSetIPCIDRExport.snapshot()
 	require.NotNil(t, exported.IPv4)
 	require.NotNil(t, exported.IPv6)
 	require.NotNil(t, exported.ScopedIPv4)
@@ -189,11 +189,23 @@ func TestRuleSetIPCIDREmptyExportIsIterable(t *testing.T) {
 	require.Empty(t, exported.Skipped)
 }
 
+func TestRuleSetIPCIDRRepeatedSnapshotDoesNotAllocate(t *testing.T) {
+	export := buildRuleSetIPCIDRExport([]option.HeadlessRule{
+		defaultExportRule(option.DefaultHeadlessRule{IPCIDR: []string{"192.0.2.0/24", "2001:db8::/32"}}),
+		defaultExportRule(option.DefaultHeadlessRule{IPCIDR: []string{"198.51.100.0/24"}, Port: []uint16{443}}),
+	})
+	first := export.snapshot()
+	var next adapter.RuleSetIPCIDRExport
+	allocations := testing.AllocsPerRun(5, func() { next = export.snapshot() })
+	require.Zero(t, allocations)
+	require.Equal(t, first, next)
+}
+
 // The digest follows the content alone: the same rules give the same digest on
 // every load, and anything a consumer would write differently changes it.
 func TestRuleSetIPCIDRExportDigest(t *testing.T) {
 	export := func(options option.DefaultHeadlessRule) adapter.RuleSetIPCIDRExport {
-		return buildRuleSetIPCIDRExport([]option.HeadlessRule{defaultExportRule(options)})
+		return buildRuleSetIPCIDRExport([]option.HeadlessRule{defaultExportRule(options)}).snapshot()
 	}
 	plain := export(option.DefaultHeadlessRule{IPCIDR: []string{"192.0.2.0/24"}})
 	require.Len(t, plain.Digest, 64)
@@ -205,7 +217,7 @@ func TestRuleSetIPCIDRExportDigest(t *testing.T) {
 		export(option.DefaultHeadlessRule{IPCIDR: []string{"198.51.100.0/24"}}),
 		export(option.DefaultHeadlessRule{IPCIDR: []string{"192.0.2.0/24"}, Network: []string{"udp"}}),
 		export(option.DefaultHeadlessRule{IPCIDR: []string{"192.0.2.0/24"}, Port: []uint16{443}}),
-		emptyRuleSetIPCIDRExport(),
+		emptyRuleSetIPCIDRExport.snapshot(),
 	} {
 		require.Len(t, changed.Digest, 64)
 		require.NotEqual(t, plain.Digest, changed.Digest)

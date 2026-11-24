@@ -54,7 +54,7 @@ type RemoteRuleSet struct {
 	access         sync.RWMutex
 	rules          []adapter.HeadlessRule
 	metadata       adapter.RuleSetMetadata
-	ipCIDRExport   adapter.RuleSetIPCIDRExport
+	ipCIDRExport   *ruleSetIPCIDRExport
 	contentFormat  string
 	revision       uint64
 	lastUpdated    time.Time
@@ -163,14 +163,22 @@ func (s *RemoteRuleSet) Metadata() adapter.RuleSetMetadata {
 
 func (s *RemoteRuleSet) ProviderSnapshot() adapter.RuleSetProviderSnapshot {
 	s.access.RLock()
-	defer s.access.RUnlock()
-	return adapter.RuleSetProviderSnapshot{
+	snapshot := adapter.RuleSetProviderSnapshot{
 		Type:      s.options.Type,
 		Format:    s.contentFormat,
 		UpdatedAt: s.lastUpdated,
 		Revision:  s.revision,
-		IPCIDR:    s.ipCIDRExport,
 	}
+	export := s.ipCIDRExport
+	s.access.RUnlock()
+	snapshot.IPCIDR = export.snapshot()
+	return snapshot
+}
+
+func (s *RemoteRuleSet) ProviderRevision() uint64 {
+	s.access.RLock()
+	defer s.access.RUnlock()
+	return s.revision
 }
 
 func (s *RemoteRuleSet) updatedAt() time.Time {
@@ -232,7 +240,7 @@ func (s *RemoteRuleSet) loadBytes(content []byte, lastUpdated time.Time, lastEta
 	if err != nil {
 		return err
 	}
-	ipCIDRExport := emptyRuleSetIPCIDRExport()
+	ipCIDRExport := emptyRuleSetIPCIDRExport
 	if metadata.ContainsIPCIDRRule {
 		ipCIDRExport = buildRuleSetIPCIDRExport(plainRuleSet.Rules)
 	}
@@ -468,17 +476,9 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) (bool, error) {
 		s.lastUpdated = time.Now()
 		lastUpdated := s.lastUpdated
 		s.access.Unlock()
-		if s.cacheFile != nil {
-			savedRuleSet := s.cacheFile.LoadRuleSet(s.tag)
-			if savedRuleSet != nil {
-				savedRuleSet.LastUpdated = lastUpdated
-				savedRuleSet.URLHash = s.urlHash[:]
-				err = s.cacheFile.SaveRuleSet(s.tag, savedRuleSet)
-				if err != nil {
-					s.logger.Error("save rule-set updated time: ", err)
-					return false, nil
-				}
-			}
+		if err := s.updateCachedTime(lastUpdated); err != nil {
+			s.logger.Error("save rule-set updated time: ", err)
+			return false, nil
 		}
 		s.logger.Info("update rule-set ", s.tag, ": not modified")
 		return false, nil
@@ -519,6 +519,27 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) (bool, error) {
 	}
 	s.logger.Info("updated rule-set ", s.tag)
 	return true, nil
+}
+
+func (s *RemoteRuleSet) updateCachedTime(updatedAt time.Time) error {
+	if s.cacheFile == nil {
+		return nil
+	}
+	if cache, ok := s.cacheFile.(interface {
+		UpdateRuleSetLastUpdated(tag string, updatedAt time.Time, urlHash []byte) (bool, error)
+	}); ok {
+		found, err := cache.UpdateRuleSetLastUpdated(s.tag, updatedAt, s.urlHash[:])
+		if found || err != nil {
+			return err
+		}
+	}
+	saved := s.cacheFile.LoadRuleSet(s.tag)
+	if saved == nil {
+		return nil
+	}
+	saved.LastUpdated = updatedAt
+	saved.URLHash = s.urlHash[:]
+	return s.cacheFile.SaveRuleSet(s.tag, saved)
 }
 
 func (s *RemoteRuleSet) resolveTransport() (adapter.HTTPTransport, error) {

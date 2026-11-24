@@ -45,6 +45,46 @@ func TestRuleSetFile(t *testing.T) {
 	require.Nil(t, cacheFile.LoadRuleSet("other"))
 }
 
+func TestUpdateRuleSetLastUpdatedKeepsFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cache.db")
+	cacheFile := openTestCacheFile(t, path)
+	defer cacheFile.Close()
+	const tag = "test"
+	content := []byte("203.0.113.0/24\n")
+	require.NoError(t, cacheFile.SaveRuleSet(tag, &adapter.SavedBinary{
+		Content:     content,
+		LastUpdated: time.Unix(100, 0),
+		LastEtag:    "original-etag",
+	}))
+	contentPath := filepath.Join(cacheFile.ruleSetDirectory(), ruleSetFileName(cacheFile.cacheID, tag))
+	before, err := os.Stat(contentPath)
+	require.NoError(t, err)
+
+	updatedAt := time.Unix(200, 0)
+	urlHash := []byte{1, 2, 3}
+	found, err := cacheFile.UpdateRuleSetLastUpdated(tag, updatedAt, urlHash)
+	require.NoError(t, err)
+	require.True(t, found)
+	after, err := os.Stat(contentPath)
+	require.NoError(t, err)
+	require.True(t, os.SameFile(before, after), "updating metadata replaced the content file")
+	saved := cacheFile.LoadRuleSet(tag)
+	require.NotNil(t, saved)
+	require.Equal(t, content, saved.Content)
+	require.Equal(t, "original-etag", saved.LastEtag)
+	require.True(t, updatedAt.Equal(saved.LastUpdated))
+	require.Equal(t, urlHash, saved.URLHash)
+
+	found, err = cacheFile.UpdateRuleSetLastUpdated(tag, updatedAt.Add(time.Second), []byte{4, 5, 6})
+	require.NoError(t, err)
+	require.True(t, found)
+	require.True(t, updatedAt.Equal(cacheFile.LoadRuleSet(tag).LastUpdated))
+
+	found, err = cacheFile.UpdateRuleSetLastUpdated("missing", updatedAt, urlHash)
+	require.NoError(t, err)
+	require.False(t, found)
+}
+
 // A rule set an earlier version kept in the database is read from there until it is saved
 // again; the save moves it into its file.
 func TestRuleSetFileFromDatabase(t *testing.T) {

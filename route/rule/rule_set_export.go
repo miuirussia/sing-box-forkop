@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
@@ -38,7 +39,28 @@ type ruleSetScopedAccumulator struct {
 	builder  netipx.IPSetBuilder
 }
 
-func buildRuleSetIPCIDRExport(rules []option.HeadlessRule) adapter.RuleSetIPCIDRExport {
+type ruleSetExportPrefixes struct {
+	ipv4 []byte
+	ipv6 []byte
+}
+
+type ruleSetExportScope struct {
+	prefixes ruleSetExportPrefixes
+	networks []string
+	ports    []adapter.RuleSetPortRange
+}
+
+type ruleSetIPCIDRExport struct {
+	prefixes     ruleSetExportPrefixes
+	scopes       []ruleSetExportScope
+	skipped      []adapter.RuleSetIPCIDRSkipped
+	snapshotOnce sync.Once
+	formatted    adapter.RuleSetIPCIDRExport
+}
+
+var emptyRuleSetIPCIDRExport = &ruleSetIPCIDRExport{}
+
+func buildRuleSetIPCIDRExport(rules []option.HeadlessRule) *ruleSetIPCIDRExport {
 	var (
 		unscopedBuilder netipx.IPSetBuilder
 		scopedBuilders  map[string]*ruleSetScopedAccumulator
@@ -80,14 +102,9 @@ func buildRuleSetIPCIDRExport(rules []option.HeadlessRule) adapter.RuleSetIPCIDR
 	}
 
 	unscoped, _ := unscopedBuilder.IPSet()
-	result := emptyRuleSetIPCIDRExport()
-	result.Skipped = normalizeRuleSetSkipped(skipped)
-	for _, prefix := range unscoped.Prefixes() {
-		if prefix.Addr().Is4() {
-			result.IPv4 = append(result.IPv4, prefix.String())
-		} else {
-			result.IPv6 = append(result.IPv6, prefix.String())
-		}
+	result := &ruleSetIPCIDRExport{
+		prefixes: encodeRuleSetPrefixes(unscoped),
+		skipped:  normalizeRuleSetSkipped(skipped),
 	}
 
 	keys := make([]string, 0, len(scopedBuilders))
@@ -99,13 +116,9 @@ func buildRuleSetIPCIDRExport(rules []option.HeadlessRule) adapter.RuleSetIPCIDR
 		accumulator := scopedBuilders[key]
 		accumulator.builder.RemoveSet(unscoped)
 		ipSet, _ := accumulator.builder.IPSet()
-		var ipv4Prefixes, ipv6Prefixes []string
-		for _, prefix := range ipSet.Prefixes() {
-			if prefix.Addr().Is4() {
-				ipv4Prefixes = append(ipv4Prefixes, prefix.String())
-			} else {
-				ipv6Prefixes = append(ipv6Prefixes, prefix.String())
-			}
+		prefixes := encodeRuleSetPrefixes(ipSet)
+		if len(prefixes.ipv4) == 0 && len(prefixes.ipv6) == 0 {
+			continue
 		}
 		networks := accumulator.networks
 		if networks == nil {
@@ -115,39 +128,91 @@ func buildRuleSetIPCIDRExport(rules []option.HeadlessRule) adapter.RuleSetIPCIDR
 		if ports == nil {
 			ports = make([]adapter.RuleSetPortRange, 0)
 		}
-		if len(ipv4Prefixes) > 0 {
-			result.ScopedIPv4 = append(result.ScopedIPv4, adapter.RuleSetIPCIDRScoped{
-				Prefixes:   ipv4Prefixes,
-				Networks:   networks,
-				PortRanges: ports,
+		result.scopes = append(result.scopes, ruleSetExportScope{prefixes: prefixes, networks: networks, ports: ports})
+	}
+	return result
+}
+
+// A binary prefix contains four or sixteen address bytes followed by its prefix length.
+func encodeRuleSetPrefixes(ipSet *netipx.IPSet) ruleSetExportPrefixes {
+	prefixes := ipSet.Prefixes()
+	var ipv4Count int
+	for _, prefix := range prefixes {
+		if prefix.Addr().Is4() {
+			ipv4Count++
+		}
+	}
+	encoded := ruleSetExportPrefixes{
+		ipv4: make([]byte, 0, ipv4Count*ipv4PrefixSize),
+		ipv6: make([]byte, 0, (len(prefixes)-ipv4Count)*ipv6PrefixSize),
+	}
+	for _, prefix := range prefixes {
+		if prefix.Addr().Is4() {
+			encoded.ipv4 = common.Must1(prefix.AppendBinary(encoded.ipv4))
+		} else {
+			encoded.ipv6 = common.Must1(prefix.AppendBinary(encoded.ipv6))
+		}
+	}
+	return encoded
+}
+
+const ipv4PrefixSize, ipv6PrefixSize = 5, 17
+
+func formatRuleSetPrefixes(encoded []byte, size int) []string {
+	prefixes := make([]string, len(encoded)/size)
+	for index := range prefixes {
+		var prefix netip.Prefix
+		common.Must(prefix.UnmarshalBinary(encoded[index*size : (index+1)*size]))
+		prefixes[index] = prefix.String()
+	}
+	return prefixes
+}
+
+func (e *ruleSetIPCIDRExport) snapshot() adapter.RuleSetIPCIDRExport {
+	if e == nil {
+		return adapter.RuleSetIPCIDRExport{}
+	}
+	e.snapshotOnce.Do(func() {
+		e.formatted = e.formatSnapshot()
+		e.prefixes = ruleSetExportPrefixes{}
+		e.scopes = nil
+		e.skipped = nil
+	})
+	return e.formatted
+}
+
+func (e *ruleSetIPCIDRExport) formatSnapshot() adapter.RuleSetIPCIDRExport {
+	export := adapter.RuleSetIPCIDRExport{
+		IPv4:       formatRuleSetPrefixes(e.prefixes.ipv4, ipv4PrefixSize),
+		IPv6:       formatRuleSetPrefixes(e.prefixes.ipv6, ipv6PrefixSize),
+		ScopedIPv4: make([]adapter.RuleSetIPCIDRScoped, 0),
+		ScopedIPv6: make([]adapter.RuleSetIPCIDRScoped, 0),
+		Skipped:    e.skipped,
+	}
+	for _, scope := range e.scopes {
+		if len(scope.prefixes.ipv4) > 0 {
+			export.ScopedIPv4 = append(export.ScopedIPv4, adapter.RuleSetIPCIDRScoped{
+				Prefixes:   formatRuleSetPrefixes(scope.prefixes.ipv4, ipv4PrefixSize),
+				Networks:   scope.networks,
+				PortRanges: scope.ports,
 			})
 		}
-		if len(ipv6Prefixes) > 0 {
-			result.ScopedIPv6 = append(result.ScopedIPv6, adapter.RuleSetIPCIDRScoped{
-				Prefixes:   ipv6Prefixes,
-				Networks:   networks,
-				PortRanges: ports,
+		if len(scope.prefixes.ipv6) > 0 {
+			export.ScopedIPv6 = append(export.ScopedIPv6, adapter.RuleSetIPCIDRScoped{
+				Prefixes:   formatRuleSetPrefixes(scope.prefixes.ipv6, ipv6PrefixSize),
+				Networks:   scope.networks,
+				PortRanges: scope.ports,
 			})
 		}
 	}
-	return withRuleSetIPCIDRDigest(result)
+	export.Digest = ruleSetIPCIDRDigest(export)
+	return export
 }
 
-func emptyRuleSetIPCIDRExport() adapter.RuleSetIPCIDRExport {
-	return withRuleSetIPCIDRDigest(adapter.RuleSetIPCIDRExport{
-		IPv4:       make([]string, 0),
-		IPv6:       make([]string, 0),
-		ScopedIPv4: make([]adapter.RuleSetIPCIDRScoped, 0),
-		ScopedIPv6: make([]adapter.RuleSetIPCIDRScoped, 0),
-	})
-}
-
-func withRuleSetIPCIDRDigest(export adapter.RuleSetIPCIDRExport) adapter.RuleSetIPCIDRExport {
-	export.Digest = ""
+func ruleSetIPCIDRDigest(export adapter.RuleSetIPCIDRExport) string {
 	hash := sha256.New()
 	common.Must(json.NewEncoder(hash).Encode(export))
-	export.Digest = hex.EncodeToString(hash.Sum(nil))
-	return export
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 func exportRuleSetClauses(rule option.HeadlessRule, path string) ([]ruleSetExportClause, []adapter.RuleSetIPCIDRSkipped) {

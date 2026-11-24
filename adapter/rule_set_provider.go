@@ -11,6 +11,7 @@ type RuleSetProviderSnapshot struct {
 }
 
 type RuleSetProvider interface {
+	// ProviderSnapshot returns a snapshot whose slices are read-only.
 	ProviderSnapshot() RuleSetProviderSnapshot
 }
 

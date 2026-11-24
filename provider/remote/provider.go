@@ -513,17 +513,15 @@ func (s *ProviderRemote) updateProviderFromContent(content string) error {
 	if err != nil {
 		return err
 	}
-	s.access.Lock()
-	s.rawContent = content
-	s.access.Unlock()
+	if s.cacheFile != nil && s.cacheFile.StoreSubscriptions() {
+		s.access.Lock()
+		s.rawContent = content
+		s.access.Unlock()
+	}
 	return nil
 }
 
 func getFirstLine(content string) (string, string) {
-	lines := strings.Split(content, "\n")
-	if len(lines) == 1 {
-		return lines[0], ""
-	}
-	others := strings.Join(lines[1:], "\n")
-	return lines[0], others
+	line, rest, _ := strings.Cut(content, "\n")
+	return line, rest
 }

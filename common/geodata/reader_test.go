@@ -73,14 +73,45 @@ func TestIndex(t *testing.T) {
 	}
 }
 
+func TestIndexCountsItemsAcrossBufferBoundaries(t *testing.T) {
+	t.Parallel()
+	const shortCount = 3000
+	entry := bytes.Repeat(message(2, []byte("short item")), shortCount)
+	entry = append(entry, message(2, bytes.Repeat([]byte{'x'}, 128))...)
+	entry = append(entry, 0x92, 0x00, 0x80, 0x00) // Field 2 and length 0, both encoded over two bytes.
+	entry = append(entry, uintField(3, 1)...)
+	entry = append(entry, message(1, []byte("first"))...)
+	entry = append(entry, message(2, nil)...)
+	first := message(1, entry)
+	data := append(first, geoEntry("second", []byte("another item"))...)
+
+	catalog, err := Index(database(t, data), "geosite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.Tags) != 2 {
+		t.Fatalf("got %d tags, want 2", len(catalog.Tags))
+	}
+	want := Entry{Name: "first", Count: shortCount + 3, Offset: int64(len(first) - len(entry)), Length: int64(len(entry))}
+	if got := catalog.Tags[0]; got != want {
+		t.Errorf("first tag = %+v, want %+v", got, want)
+	}
+	if got := catalog.Tags[1]; got.Name != "second" || got.Count != 1 {
+		t.Errorf("got second tag %+v, want second with one item", got)
+	}
+}
+
 func TestIndexInvalid(t *testing.T) {
 	t.Parallel()
+	first := append(message(1, []byte("first")), 0x12, 0x00, 0x12, 0x01)
+	truncatedItem := append(message(1, first), geoEntry("second")...)
 	tests := []struct {
 		name string
 		data []byte
 	}{
 		{"empty", nil}, {"truncated length", []byte{0x0a, 0x80}},
 		{"oversized length", []byte{0x0a, 0xff, 0xff, 0xff, 0xff, 0x7f}},
+		{"truncated item before next tag", truncatedItem},
 		{"invalid wire type", []byte{0x0f}}, {"zero field", []byte{0}},
 		{"overflow", bytes.Repeat([]byte{0xff}, 11)},
 		{"duplicate", append(geoEntry("google"), geoEntry("GOOGLE")...)},

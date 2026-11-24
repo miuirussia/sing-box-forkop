@@ -63,3 +63,45 @@ func TestReceiveIPTakesWholeGROMessage(t *testing.T) {
 		}
 	}
 }
+
+func TestAdaptiveReceiveBuffers(t *testing.T) {
+	bind := NewStdNetBind(nil).(*StdNetBind)
+	bind.EnableAdaptiveReceiveBuffers()
+	batch := bind.BatchSize()
+	bufs := make([][]byte, batch)
+	groBuffer := make([]byte, 65535)
+	bufs[batch-1] = groBuffer[:0]
+	sizes := make([]int, batch)
+	eps := make([]Endpoint, batch)
+	const gsoSize = 1000
+	reader := &groReader{segments: udpSegmentMaxDatagrams, gsoSize: gsoSize}
+	for range 2 {
+		n, err := bind.receiveIP(reader, nil, true, bufs, sizes, eps)
+		if err != nil || n != udpSegmentMaxDatagrams {
+			t.Fatalf("GRO receive returned %d packets, error %v", n, err)
+		}
+		if &bufs[batch-1][0] != &groBuffer[0] {
+			t.Fatal("GRO receive replaced a buffer with sufficient capacity")
+		}
+		var bytesInBatch int
+		for i := range n {
+			bytesInBatch += cap(bufs[i])
+			if sizes[i] != gsoSize || bufs[i][0] != byte(i) || bufs[i][sizes[i]-1] != byte(i) || eps[i] == nil {
+				t.Fatalf("invalid GRO packet %d: size %d, endpoint %v", i, sizes[i], eps[i])
+			}
+		}
+		if bytesInBatch > 160*1024 {
+			t.Fatalf("GRO batch retained %d bytes", bytesInBatch)
+		}
+	}
+
+	// A socket without GRO still accepts a maximum-sized UDP payload.
+	clear(bufs)
+	bufs[0] = make([]byte, 0)
+	const maxPayload = 65507
+	reader = &groReader{segments: 1, gsoSize: maxPayload}
+	n, err := bind.receiveIP(reader, nil, false, bufs, sizes, eps)
+	if err != nil || n != 1 || sizes[0] != maxPayload || eps[0] == nil {
+		t.Fatalf("UDP receive returned %d packets, size %d, endpoint %v, error %v", n, sizes[0], eps[0], err)
+	}
+}

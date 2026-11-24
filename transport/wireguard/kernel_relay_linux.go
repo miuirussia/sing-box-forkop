@@ -45,6 +45,9 @@ func newKernelUDPRelay(endpoint *Endpoint, linkKind string) (_ *kernelUDPRelay, 
 		return nil, nil, nil, fmt.Errorf("%w: kernel UDP relay requires at least one peer", errKernelUnavailable)
 	}
 	bind, connectDomain := endpoint.createBind()
+	if standardBind, ok := bind.(*conn.StdNetBind); ok {
+		standardBind.EnableAdaptiveReceiveBuffers()
+	}
 	relay := &kernelUDPRelay{
 		endpoint: endpoint,
 		bind:     bind,
@@ -245,8 +248,10 @@ func (r *kernelUDPRelay) receivePackets(receive conn.ReceiveFunc) {
 	packets := make([][]byte, batchSize)
 	sizes := make([]int, batchSize)
 	sources := make([]conn.Endpoint, batchSize)
-	for i := range packets {
-		packets[i] = make([]byte, 65535)
+	if _, isStandardBind := r.bind.(*conn.StdNetBind); !isStandardBind {
+		for i := range packets {
+			packets[i] = make([]byte, 65535)
+		}
 	}
 	for {
 		count, err := receive(packets, sizes, sources)

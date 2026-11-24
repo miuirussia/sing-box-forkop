@@ -48,7 +48,7 @@ type Client struct {
 	initDNSCacheFunc  func() adapter.DNSCacheStore
 	networkManager    adapter.NetworkManager
 	logger            logger.ContextLogger
-	cache             *freelru.Cache[dnsCacheKey, *dns.Msg]
+	cache             *freelru.Cache[dnsCacheKey, dnsCacheEntry]
 	cacheLock         compatible.Map[dnsExchangeKey, chan struct{}]
 	backgroundRefresh compatible.Map[dnsCacheKey, struct{}]
 	failures          failureLog
@@ -95,6 +95,11 @@ type dnsCacheKey struct {
 	transportTag string
 	clientSubnet netip.Prefix
 	environment  uint64
+}
+
+type dnsCacheEntry struct {
+	response        *dns.Msg
+	expiresAtMillis int64
 }
 
 type dnsExchangeKey struct {
@@ -182,7 +187,19 @@ func (c *Client) initializeMemoryCache() {
 	if c.disableCache || c.cache != nil {
 		return
 	}
-	c.cache = common.Must1(freelru.New[dnsCacheKey, *dns.Msg](c.cacheCapacity, maphash.NewHasher[dnsCacheKey]().Hash32, true))
+	c.cache = c.newMemoryCache(maphash.NewHasher[dnsCacheKey]().Hash32)
+}
+
+func (c *Client) newMemoryCache(hash freelru.HashKeyCallback[dnsCacheKey]) *freelru.Cache[dnsCacheKey, dnsCacheEntry] {
+	cache := common.Must1(freelru.New[dnsCacheKey, dnsCacheEntry](c.cacheCapacity, hash, true))
+	if !c.disableExpire {
+		staleWindow := max(c.optimisticTimeout, 0)
+		// The LRU checks and evicts the current entry under the same lock.
+		cache.SetHealthCheck(func(_ dnsCacheKey, entry dnsCacheEntry) bool {
+			return time.Now().Before(time.UnixMilli(entry.expiresAtMillis).Add(staleWindow))
+		})
+	}
+	return cache
 }
 
 func extractNegativeTTL(response *dns.Msg) (uint32, bool) {
@@ -290,6 +307,40 @@ func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTranspo
 			}))
 	message = c.prepareExchangeMessage(message, options)
 	disableCache := !isSimpleRequest || c.disableCache || options.DisableCache
+	var cacheKey dnsCacheKey
+	loadCachedResponse := func(release func()) (*dns.Msg, error) {
+		response, ttl, isStale := c.loadResponse(cacheKey, !options.DisableOptimisticCache)
+		if response == nil {
+			return nil, nil
+		}
+		if release != nil {
+			release()
+		}
+		if isStale {
+			c.backgroundRefreshDNS(transport, cacheKey, message.Copy(), options, responseChecker)
+		}
+		if responseChecker != nil && !responseChecker(response) {
+			logRejectedResponse(c.logger, ctx, response)
+			return nil, ErrResponseRejectedCached
+		}
+		if isStale {
+			logOptimisticResponse(c.logger, ctx, response)
+		} else {
+			logCachedResponse(c.logger, ctx, response, ttl)
+		}
+		response.Id = message.Id
+		return response, nil
+	}
+	if !disableCache {
+		cacheKey = c.newCacheKey(transport, question, message, options)
+		// Avoid setting up a coalesced exchange for an in-memory hit. A miss
+		// is checked again after acquiring the slot. Disk lookups only run once.
+		if c.cache != nil && c.dnsCache == nil {
+			if response, err := loadCachedResponse(nil); response != nil || err != nil {
+				return nil, response, exchangeDone, err
+			}
+		}
+	}
 	ctx = contextWithTransportStack(ctx, append(transportStack, transport.Tag()))
 	operation := &exchangeOperation{
 		message:         message,
@@ -300,7 +351,6 @@ func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTranspo
 		disableCache:    disableCache,
 	}
 	if !disableCache {
-		cacheKey := c.newCacheKey(transport, question, message, options)
 		operation.cacheKey = cacheKey
 		exchangeKey := dnsExchangeKey{dnsCacheKey: cacheKey, timeout: options.Timeout}
 		cond, loaded := c.cacheLock.LoadOrStore(exchangeKey, make(chan struct{}))
@@ -311,23 +361,8 @@ func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTranspo
 			}
 		}
 		for {
-			response, ttl, isStale := c.loadResponse(cacheKey)
-			if response != nil && (!isStale || !options.DisableOptimisticCache) {
-				operation.release()
-				if isStale {
-					c.backgroundRefreshDNS(transport, cacheKey, message.Copy(), options, responseChecker)
-				}
-				if responseChecker != nil && !responseChecker(response) {
-					logRejectedResponse(c.logger, ctx, response)
-					return nil, nil, exchangeDone, ErrResponseRejectedCached
-				}
-				if isStale {
-					logOptimisticResponse(c.logger, ctx, response)
-				} else {
-					logCachedResponse(c.logger, ctx, response, ttl)
-				}
-				response.Id = message.Id
-				return nil, response, exchangeDone, nil
+			if response, err := loadCachedResponse(operation.release); response != nil || err != nil {
+				return nil, response, exchangeDone, err
 			}
 			if !loaded {
 				break
@@ -533,11 +568,11 @@ func (c *Client) storeCache(key dnsCacheKey, message *dns.Msg, timeToLive uint32
 	if c.cache == nil {
 		return
 	}
-	if c.disableExpire {
-		c.cache.Add(key, message.Copy())
-	} else {
-		c.cache.AddWithLifetime(key, message.Copy(), time.Second*time.Duration(timeToLive))
+	entry := dnsCacheEntry{response: message.Copy()}
+	if !c.disableExpire {
+		entry.expiresAtMillis = time.Now().Add(time.Second * time.Duration(timeToLive)).UnixMilli()
 	}
+	c.cache.Add(key, entry)
 }
 
 func (c *Client) lookupToExchange(ctx context.Context, transport adapter.DNSTransport, name string, qType uint16, options adapter.DNSQueryOptions, responseChecker func(response *dns.Msg) bool) ([]netip.Addr, error) {
@@ -572,14 +607,11 @@ func (c *Client) lookupToExchange(ctx context.Context, transport adapter.DNSTran
 func (c *Client) questionCache(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions, responseChecker func(response *dns.Msg) bool) ([]netip.Addr, error) {
 	question := message.Question[0]
 	cacheKey := c.newCacheKey(transport, question, message, options)
-	response, _, isStale := c.loadResponse(cacheKey)
+	response, _, isStale := c.loadResponse(cacheKey, !options.DisableOptimisticCache)
 	if response == nil {
 		return nil, ErrNotCached
 	}
 	if isStale {
-		if options.DisableOptimisticCache {
-			return nil, ErrNotCached
-		}
 		c.backgroundRefreshDNS(transport, cacheKey, c.prepareExchangeMessage(message.Copy(), options), options, responseChecker)
 	}
 	if responseChecker != nil && !responseChecker(response) {
@@ -595,44 +627,53 @@ func (c *Client) questionCache(ctx context.Context, transport adapter.DNSTranspo
 	return MessageToAddresses(response), nil
 }
 
-func (c *Client) loadResponse(key dnsCacheKey) (*dns.Msg, int, bool) {
+func (c *Client) loadResponse(key dnsCacheKey, allowStale bool) (*dns.Msg, int, bool) {
 	if c.dnsCache != nil {
-		return c.loadPersistentResponse(key)
+		return c.loadPersistentResponse(key, allowStale)
 	}
 	if c.cache == nil {
 		return nil, 0, false
 	}
-	if c.disableExpire {
-		response, loaded := c.cache.Get(key)
-		if !loaded {
-			return nil, 0, false
-		}
-		return response.Copy(), 0, false
-	}
-	response, expireAt, loaded := c.cache.GetWithLifetimeNoExpire(key)
+	entry, loaded := c.cache.Get(key)
 	if !loaded {
 		return nil, 0, false
 	}
+	if c.disableExpire {
+		return entry.response.Copy(), 0, false
+	}
+	expireAt := time.UnixMilli(entry.expiresAtMillis)
 	timeNow := time.Now()
 	if timeNow.After(expireAt) {
-		if c.optimisticTimeout > 0 && timeNow.Before(expireAt.Add(c.optimisticTimeout)) {
-			response = response.Copy()
-			normalizeTTL(response, 1)
-			return response, 0, true
+		if !allowStale || c.optimisticTimeout <= 0 || !timeNow.Before(expireAt.Add(c.optimisticTimeout)) {
+			return nil, 0, false
 		}
-		c.cache.Remove(key)
-		return nil, 0, false
+		response := entry.response.Copy()
+		normalizeTTL(response, 1)
+		return response, 0, true
 	}
 	nowTTL := max(int(expireAt.Sub(timeNow).Seconds()), 0)
-	response = response.Copy()
+	response := entry.response.Copy()
 	normalizeTTL(response, uint32(nowTTL))
 	return response, nowTTL, false
 }
 
-func (c *Client) loadPersistentResponse(key dnsCacheKey) (*dns.Msg, int, bool) {
+func (c *Client) loadPersistentResponse(key dnsCacheKey, allowStale bool) (*dns.Msg, int, bool) {
 	rawMessage, expireAt, loaded := c.dnsCache.LoadDNSCache(key.persistentName(), key.Name, key.Qtype)
 	if !loaded {
 		return nil, 0, false
+	}
+	var ttl int
+	var isStale bool
+	if !c.disableExpire {
+		timeNow := time.Now()
+		isStale = timeNow.After(expireAt)
+		if isStale {
+			if !allowStale || c.optimisticTimeout <= 0 || !timeNow.Before(expireAt.Add(c.optimisticTimeout)) {
+				return nil, 0, false
+			}
+		} else {
+			ttl = max(int(expireAt.Sub(timeNow).Seconds()), 0)
+		}
 	}
 	response := new(dns.Msg)
 	err := response.Unpack(rawMessage)
@@ -642,17 +683,12 @@ func (c *Client) loadPersistentResponse(key dnsCacheKey) (*dns.Msg, int, bool) {
 	if c.disableExpire {
 		return response, 0, false
 	}
-	timeNow := time.Now()
-	if timeNow.After(expireAt) {
-		if c.optimisticTimeout > 0 && timeNow.Before(expireAt.Add(c.optimisticTimeout)) {
-			normalizeTTL(response, 1)
-			return response, 0, true
-		}
-		return nil, 0, false
+	if isStale {
+		normalizeTTL(response, 1)
+	} else {
+		normalizeTTL(response, uint32(ttl))
 	}
-	nowTTL := max(int(expireAt.Sub(timeNow).Seconds()), 0)
-	normalizeTTL(response, uint32(nowTTL))
-	return response, nowTTL, false
+	return response, ttl, isStale
 }
 
 func applyResponseOptions(question dns.Question, response *dns.Msg, options adapter.DNSQueryOptions) uint32 {

@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"slices"
 	"strconv"
 	"sync"
 	"syscall"
@@ -37,13 +38,14 @@ var _ Bind = (*StdNetBind)(nil)
 // methods for sending and receiving multiple datagrams per-syscall. See the
 // proposal in https://github.com/golang/go/issues/45886#issuecomment-1218301564.
 type StdNetBind struct {
-	externalControl     control.Func
-	listenUDP           func(net.ListenConfig, string, int) (*net.UDPConn, error)
-	egressProvider      EgressProvider
-	onRead              func(size int)
-	onWrite             func(size int)
-	reservedAccess      sync.RWMutex
-	reservedForEndpoint map[netip.AddrPort][3]uint8
+	externalControl        control.Func
+	listenUDP              func(net.ListenConfig, string, int) (*net.UDPConn, error)
+	egressProvider         EgressProvider
+	onRead                 func(size int)
+	onWrite                func(size int)
+	adaptiveReceiveBuffers bool
+	reservedAccess         sync.RWMutex
+	reservedForEndpoint    map[netip.AddrPort][3]uint8
 
 	mu            sync.Mutex // protects all fields except as specified
 	ipv4          *net.UDPConn
@@ -290,6 +292,9 @@ again:
 	if s.egressProvider != nil {
 		s.egressProvider.SetEgressPort(uint16(port))
 		fns = append(fns, func(bufs [][]byte, sizes []int, endpoints []Endpoint) (int, error) {
+			if s.adaptiveReceiveBuffers && len(bufs[0]) == 0 {
+				bufs[0] = slices.Grow(bufs[0], 65535)[:65535]
+			}
 			dataLength, source, err := s.egressProvider.ReceiveEgress(bufs[0])
 			if err != nil {
 				return 0, err
@@ -329,6 +334,12 @@ func (s *StdNetBind) SetIOActivityFuncs(onRead func(size int), onWrite func(size
 	s.onWrite = onWrite
 }
 
+// EnableAdaptiveReceiveBuffers lets Linux callers pass empty packet buffers
+// and reuse the slices returned in the batch. Call it before opening the bind.
+func (s *StdNetBind) EnableAdaptiveReceiveBuffers() {
+	s.adaptiveReceiveBuffers = true
+}
+
 func (s *StdNetBind) putMessages(msgs *[]ipv6.Message) {
 	for i := range *msgs {
 		buffers := (*msgs)[i].Buffers
@@ -365,6 +376,11 @@ func (s *StdNetBind) receiveIP(
 ) (n int, err error) {
 	msgs := s.getMessages()
 	for i := range bufs {
+		// GRO reads into the last slot. The other slots only hold individual
+		// segments, so its splitter grows those as needed.
+		if s.adaptiveReceiveBuffers && len(bufs[i]) == 0 && (!rxOffload || i == len(bufs)-1) {
+			bufs[i] = slices.Grow(bufs[i], 65535)[:65535]
+		}
 		(*msgs)[i].Buffers[0] = bufs[i]
 		(*msgs)[i].OOB = (*msgs)[i].OOB[:cap((*msgs)[i].OOB)]
 	}
@@ -377,7 +393,7 @@ func (s *StdNetBind) receiveIP(
 			if err != nil {
 				return 0, err
 			}
-			numMsgs, err = splitCoalescedMessages(*msgs, readAt, getGSOSize)
+			numMsgs, err = splitCoalescedMessages(*msgs, readAt, getGSOSize, s.adaptiveReceiveBuffers)
 			if err != nil {
 				return 0, err
 			}
@@ -397,6 +413,9 @@ func (s *StdNetBind) receiveIP(
 	}
 	for i := 0; i < numMsgs; i++ {
 		msg := &(*msgs)[i]
+		if s.adaptiveReceiveBuffers && rxOffload {
+			bufs[i] = msg.Buffers[0]
+		}
 		sizes[i] = msg.N
 		if sizes[i] == 0 {
 			continue
@@ -700,7 +719,7 @@ func coalesceMessages(addr *net.UDPAddr, ep *StdNetEndpoint, bufs [][]byte, offs
 
 type getGSOFunc func(control []byte) (int, error)
 
-func splitCoalescedMessages(msgs []ipv6.Message, firstMsgAt int, getGSO getGSOFunc) (n int, err error) {
+func splitCoalescedMessages(msgs []ipv6.Message, firstMsgAt int, getGSO getGSOFunc, growBuffers bool) (n int, err error) {
 	for i := firstMsgAt; i < len(msgs); i++ {
 		msg := &msgs[i]
 		if msg.N == 0 {
@@ -724,9 +743,13 @@ func splitCoalescedMessages(msgs []ipv6.Message, firstMsgAt int, getGSO getGSOFu
 			if n > i {
 				return n, errors.New("splitting coalesced packet resulted in overflow")
 			}
-			copied := copy(msgs[n].Buffers[0], msg.Buffers[0][start:end])
-			msgs[n].N = copied
-			msgs[n].Addr = msg.Addr
+			dst := &msgs[n]
+			if growBuffers && len(dst.Buffers[0]) < end-start {
+				size := min(max(end-start, 2*len(dst.Buffers[0]), 1536), 65535)
+				dst.Buffers[0] = make([]byte, size)
+			}
+			dst.N = copy(dst.Buffers[0], msg.Buffers[0][start:end])
+			dst.Addr = msg.Addr
 			start = end
 			end += gsoSize
 			if end > msg.N {

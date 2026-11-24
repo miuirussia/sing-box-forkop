@@ -52,12 +52,12 @@ func ruleSetFileName(cacheID []byte, tag string) string {
 
 // ruleSetRecord is what the bucket keeps of a rule set: the size of its content, then the
 // rest of adapter.SavedBinary as it writes itself, without the content.
-func ruleSetRecord(set *adapter.SavedBinary) ([]byte, error) {
+func ruleSetRecord(set *adapter.SavedBinary, size uint64) ([]byte, error) {
 	rest, err := (&adapter.SavedBinary{LastUpdated: set.LastUpdated, LastEtag: set.LastEtag, URLHash: set.URLHash}).MarshalBinary()
 	if err != nil {
 		return nil, err
 	}
-	record := binary.AppendUvarint([]byte{1}, uint64(len(set.Content)))
+	record := binary.AppendUvarint([]byte{1}, size)
 	return append(record, rest...), nil
 }
 
@@ -120,10 +120,51 @@ func (c *CacheFile) loadRuleSetFile(tag string) (saved *adapter.SavedBinary, fou
 	return saved, true
 }
 
+// UpdateRuleSetLastUpdated updates the metadata of a file-backed rule set.
+// It reports whether the file-backed record was found, even if its file is missing.
+func (c *CacheFile) UpdateRuleSetLastUpdated(tag string, updatedAt time.Time, urlHash []byte) (found bool, err error) {
+	err = c.batch(func(tx *bbolt.Tx) error {
+		found = false
+		bucket := c.bucket(tx, bucketRuleSetFile)
+		if bucket == nil {
+			return nil
+		}
+		key := []byte(tag)
+		metadata := bucket.Get(key)
+		if metadata == nil {
+			return nil
+		}
+		found = true
+		saved, size, err := parseRuleSetRecord(metadata)
+		if err != nil {
+			return err
+		}
+		if len(saved.URLHash) != 0 && !bytes.Equal(saved.URLHash, urlHash) {
+			return nil
+		}
+		path := filepath.Join(c.ruleSetDirectory(), ruleSetFileName(c.cacheID, tag))
+		stat, err := os.Stat(path)
+		if err != nil {
+			return err
+		}
+		if !stat.Mode().IsRegular() || uint64(stat.Size()) != size {
+			return E.New("invalid rule-set cache file: ", path)
+		}
+		saved.LastUpdated = updatedAt
+		saved.URLHash = urlHash
+		metadata, err = ruleSetRecord(saved, size)
+		if err != nil {
+			return err
+		}
+		return bucket.Put(key, metadata)
+	})
+	return found, err
+}
+
 // saveRuleSetFile writes the content of a rule set into its file, then its record; the
 // record of an earlier version goes.
 func (c *CacheFile) saveRuleSetFile(tag string, set *adapter.SavedBinary) error {
-	record, err := ruleSetRecord(set)
+	record, err := ruleSetRecord(set, uint64(len(set.Content)))
 	if err != nil {
 		return err
 	}

@@ -102,6 +102,9 @@ func Index(path, kind string) (*Catalog, error) {
 			case field == 2 && wireType == 2:
 				entry.Count++
 				err = w.skip(wireType, end)
+				if err == nil {
+					entry.Count += w.skipBufferedItems(end)
+				}
 			default:
 				err = w.skip(wireType, end)
 			}
@@ -138,6 +141,34 @@ type wire struct {
 }
 
 func newWire(r io.Reader) *wire { return &wire{reader: bufio.NewReaderSize(r, 32*1024)} }
+
+// skipBufferedItems counts consecutive field 2 messages with single-byte
+// lengths. Other encodings and items that cross a buffer or entry boundary
+// go through the normal wire parser.
+func (w *wire) skipBufferedItems(end int64) int {
+	const itemTag = 2<<3 | 2
+	buffered := int(min(int64(w.reader.Buffered()), end-w.pos))
+	if buffered < 2 {
+		return 0
+	}
+	data, _ := w.reader.Peek(buffered)
+	var count int
+	for len(data) >= 2 && data[0] == itemTag {
+		size := int(data[1])
+		if size >= 0x80 || size > len(data)-2 {
+			break
+		}
+		data = data[size+2:]
+		count++
+	}
+	if count > 0 {
+		consumed := buffered - len(data)
+		// All consumed bytes were already buffered, so Discard cannot fail.
+		w.reader.Discard(consumed)
+		w.pos += int64(consumed)
+	}
+	return count
+}
 
 func (w *wire) varint(end int64) (uint64, error) {
 	var value uint64
