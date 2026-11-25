@@ -5,6 +5,7 @@ import (
 	"io"
 	"maps"
 	"net"
+	"reflect"
 	"regexp"
 	"slices"
 	"sync"
@@ -37,6 +38,12 @@ var (
 	_ adapter.InterfaceUpdateListener = (*URLTest)(nil)
 )
 
+const (
+	defaultURLTestTimeout     = 5 * time.Second
+	defaultURLTestConcurrency = 10
+	maxURLTestConcurrency     = 64
+)
+
 type URLTest struct {
 	outbound.Adapter
 	ctx                          context.Context
@@ -47,6 +54,8 @@ type URLTest struct {
 	expectedStatus               urltest.ExpectedStatus
 	udpProbe                     *urltest.UDPProbe
 	interval                     time.Duration
+	probeTimeout                 time.Duration
+	probeConcurrency             int
 	tolerance                    uint16
 	idleTimeout                  time.Duration
 	group                        *URLTestGroup
@@ -68,6 +77,13 @@ type URLTest struct {
 }
 
 func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.URLTestOutboundOptions) (adapter.Outbound, error) {
+	timeout := time.Duration(options.Timeout)
+	if timeout < 0 || timeout > time.Minute {
+		return nil, E.New("invalid URLTest timeout: use a positive duration up to 1 minute")
+	}
+	if options.Concurrency < 0 || options.Concurrency > maxURLTestConcurrency {
+		return nil, E.New("invalid URLTest concurrency: use a number from 1 to ", maxURLTestConcurrency)
+	}
 	expectedStatus, err := urltest.ParseExpectedStatus(options.ExpectedStatus)
 	if err != nil {
 		return nil, E.Cause(err, "invalid URLTest expected_status")
@@ -89,6 +105,8 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 		expectedStatus:               expectedStatus,
 		udpProbe:                     udpProbe,
 		interval:                     time.Duration(options.Interval),
+		probeTimeout:                 timeout,
+		probeConcurrency:             options.Concurrency,
 		tolerance:                    options.Tolerance,
 		idleTimeout:                  time.Duration(options.IdleTimeout),
 		interruptExternalConnections: options.InterruptExistConnections,
@@ -165,6 +183,12 @@ func (s *URLTest) start() (err error) {
 	group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, s.link, s.expectedStatus, s.interval, s.tolerance, s.idleTimeout, s.interruptExternalConnections)
 	if err != nil {
 		return err
+	}
+	if s.probeTimeout > 0 {
+		group.probeTimeout = s.probeTimeout
+	}
+	if s.probeConcurrency > 0 {
+		group.probeConcurrency = s.probeConcurrency
 	}
 	if s.udpProbe != nil {
 		group.setUDPProbe(s.udpProbe)
@@ -329,13 +353,16 @@ func openURLTestConnection[T io.Closer](ctx context.Context, urlTest *URLTest, n
 			dialHistory = udpDialHistory{storage: group.udpHistory, parent: parentHistory}
 			dialContext = context.WithValue(ctx, udpDialHistoryKey{}, &dialHistory)
 		}
+		var failedTag string
+		var localHistory, sharedHistory *adapter.URLTestHistory
+		if !probeUDP {
+			failedTag = RealTag(selection.outbound, network)
+			localHistory = group.history.LoadURLTestHistory(failedTag)
+			sharedHistory = group.sharedHistory.LoadURLTestHistory(failedTag)
+		}
 		conn, err := open(dialContext, selection.outbound)
 		failedProbes := dialHistory.failedProbes
 		dialHistory.failedProbes = nil
-		var failedTag string
-		if err != nil && !probeUDP {
-			failedTag = selection.outbound.Tag()
-		}
 		// Apply the dial result while the selection is still protected by the
 		// read lock.
 		group.access.RLock()
@@ -356,8 +383,9 @@ func openURLTestConnection[T io.Closer](ctx context.Context, urlTest *URLTest, n
 			group.access.RUnlock()
 			return conn, nil
 		}
-		if !probeUDP {
-			group.deleteHistory(failedTag)
+		if !probeUDP && ctx.Err() == nil {
+			group.history.DeleteURLTestHistoryIfCurrent(failedTag, localHistory)
+			group.sharedHistory.DeleteURLTestHistoryIfCurrent(failedTag, sharedHistory)
 		}
 		dialHistory.reportFailures(ctx, failedProbes)
 		group.dialFailed(ctx, selection.outbound, err)
@@ -495,6 +523,16 @@ func (s *URLTest) onProviderUpdated(tag string) error {
 	}
 	s.tags = tags
 	s.group.access.Lock()
+	previousMembers := make(map[string]adapter.Outbound, len(s.group.outbounds))
+	for _, detour := range s.group.outbounds {
+		previousMembers[detour.Tag()] = detour
+	}
+	for _, detour := range outbounds {
+		tag := detour.Tag()
+		if previous := previousMembers[tag]; previous != nil && reflect.ValueOf(previous).Comparable() && previous != detour {
+			s.group.rememberProbeOutboundLocked(tag, detour, previous)
+		}
+	}
 	s.group.outbounds = outbounds
 	if s.group.selectedOutboundTCP != nil {
 		s.group.selectedOutboundTCP = outboundByTag(outbounds, s.group.selectedOutboundTCP.Tag(), N.NetworkTCP)
@@ -527,12 +565,15 @@ type URLTestGroup struct {
 	link                         string
 	expectedStatus               urltest.ExpectedStatus
 	interval                     time.Duration
+	probeTimeout                 time.Duration
+	probeConcurrency             int
 	tolerance                    uint16
 	idleTimeout                  time.Duration
 	history                      *urltest.HistoryStorage
 	udpHistory                   *urltest.HistoryStorage
 	udpProbe                     *urltest.UDPProbe
 	udpChecks                    map[string]*udpProbeChecks
+	probeOutbounds               map[string]adapter.Outbound
 	sharedHistory                *urltest.HistoryStorage
 	coordinator                  *urltest.Coordinator
 	checkingTCP                  atomic.Bool
@@ -544,6 +585,8 @@ type URLTestGroup struct {
 	udpSwitchGeneration          uint64
 	initialTCPReady              bool
 	initialUDPReady              bool
+	initialTCPSweepDone          bool
+	initialUDPSweepDone          bool
 	initialTCPCheckDone          chan struct{}
 	initialUDPCheckDone          chan struct{}
 	historyChanged               chan struct{}
@@ -592,9 +635,11 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		link:                         link,
 		expectedStatus:               expectedStatus,
 		interval:                     interval,
+		probeTimeout:                 defaultURLTestTimeout,
+		probeConcurrency:             defaultURLTestConcurrency,
 		tolerance:                    tolerance,
 		idleTimeout:                  idleTimeout,
-		history:                      urltest.NewHistoryStorage(),
+		history:                      urltest.NewHistoryStorageWithSmoothing(),
 		sharedHistory:                historyStorage(ctx),
 		coordinator:                  coordinator,
 		historyChanged:               make(chan struct{}),
@@ -606,7 +651,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 
 func (g *URLTestGroup) setUDPProbe(probe *urltest.UDPProbe) {
 	g.udpProbe = probe
-	g.udpHistory = urltest.NewHistoryStorage()
+	g.udpHistory = urltest.NewHistoryStorageWithSmoothing()
 	g.udpChecks = make(map[string]*udpProbeChecks)
 	g.udpInterruptGroup = interrupt.NewGroup()
 }
@@ -632,17 +677,35 @@ func freshFor(interval time.Duration) time.Duration {
 	return interval / 2
 }
 
-func (g *URLTestGroup) deleteHistory(tag string) {
-	g.history.DeleteURLTestHistory(tag)
-	g.sharedHistory.DeleteURLTestHistory(tag)
-}
-
-func (g *URLTestGroup) storeHistory(tag string, history *adapter.URLTestHistory) {
+func (g *URLTestGroup) storeHistoryLocked(tag string, history *adapter.URLTestHistory) {
 	g.history.StoreURLTestHistory(tag, history)
 	g.sharedHistory.StoreURLTestHistory(tag, history)
-	g.access.Lock()
 	g.notifyHistoryChangedLocked()
-	g.access.Unlock()
+}
+
+func (g *URLTestGroup) rememberProbeOutboundLocked(tag string, detour, previous adapter.Outbound) {
+	if measured := g.probeOutbounds[tag]; measured != nil {
+		previous = measured
+	}
+	if previous != nil && previous != detour {
+		g.history.DeleteURLTestHistory(tag)
+		if g.udpHistory != nil {
+			g.udpHistory.DeleteURLTestHistory(tag)
+		}
+	}
+	if !reflect.ValueOf(detour).Comparable() {
+		delete(g.probeOutbounds, tag)
+		return
+	}
+	if g.probeOutbounds == nil {
+		g.probeOutbounds = make(map[string]adapter.Outbound)
+	}
+	g.probeOutbounds[tag] = detour
+}
+
+func (g *URLTestGroup) probeHistoryMatchesLocked(tag string, detour adapter.Outbound) bool {
+	measured := g.probeOutbounds[tag]
+	return measured == nil || measured == detour
 }
 
 func (g *URLTestGroup) notifyHistoryChangedLocked() {
@@ -678,12 +741,12 @@ func (g *URLTestGroup) selectForDial(ctx context.Context, network string) (urlTe
 		selection := func(outbound adapter.Outbound) urlTestDialSelection {
 			return urlTestDialSelection{outbound: outbound, selected: *selected, generation: *generation}
 		}
-		if *ready && *selected != nil && (!requiresUDPProbe || g.udpHistory.LoadURLTestHistory(RealTag(*selected, network)) != nil) {
+		if *ready && *selected != nil && (!requiresUDPProbe || g.hasUDPProbeLocked(*selected)) {
 			picked := selection(*selected)
 			g.access.Unlock()
 			return picked, nil
 		}
-		outbound, tested := g.selectOutbound(network)
+		outbound, tested, _ := g.selectOutbound(network, *ready, nil)
 		if outbound == nil {
 			g.access.Unlock()
 			return urlTestDialSelection{}, E.New("missing supported outbound")
@@ -821,55 +884,90 @@ func (g *URLTestGroup) Close() error {
 func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 	g.access.RLock()
 	defer g.access.RUnlock()
-	return g.selectOutbound(network)
+	outbound, tested, _ := g.selectOutbound(network, true, nil)
+	return outbound, tested
 }
 
-func (g *URLTestGroup) selectOutbound(network string) (adapter.Outbound, bool) {
+type urlTestSweep struct {
+	outbounds []adapter.Outbound
+	tcpExits  map[string]adapter.Outbound
+	udpExits  map[string]adapter.Outbound
+}
+
+func (g *URLTestGroup) hasUDPProbeLocked(detour adapter.Outbound) bool {
+	exit := realOutbound(detour, N.NetworkUDP)
+	if exit == nil {
+		return false
+	}
+	tag := exit.Tag()
+	return g.probeHistoryMatchesLocked(tag, exit) && g.udpHistory.LoadURLTestHistory(tag) != nil
+}
+
+func (g *URLTestGroup) selectOutbound(network string, applyTolerance bool, sweep *urlTestSweep) (adapter.Outbound, bool, bool) {
 	var minDelay uint16
 	var minOutbound adapter.Outbound
+	var current adapter.Outbound
+	var smoothed bool
 	histories := g.history
 	switch network {
 	case N.NetworkTCP:
-		if g.selectedOutboundTCP != nil {
-			if history := g.history.LoadURLTestHistory(RealTag(g.selectedOutboundTCP, N.NetworkTCP)); history != nil {
-				minOutbound = g.selectedOutboundTCP
-				minDelay = history.Delay
-			}
-		}
+		current = g.selectedOutboundTCP
+		smoothed = g.initialTCPSweepDone
 	case N.NetworkUDP:
 		if g.udpHistory != nil {
 			histories = g.udpHistory
 		}
-		if g.selectedOutboundUDP != nil {
-			if history := histories.LoadURLTestHistory(RealTag(g.selectedOutboundUDP, N.NetworkUDP)); history != nil {
-				minOutbound = g.selectedOutboundUDP
-				minDelay = history.Delay
-			}
+		current = g.selectedOutboundUDP
+		smoothed = g.initialUDPSweepDone
+	}
+	// An early dial can choose a member before the sweep has covered all current exits.
+	completeSweep := !smoothed && sweep != nil && slices.Equal(sweep.outbounds, g.outbounds)
+	var checkedExits map[string]adapter.Outbound
+	if completeSweep {
+		checkedExits = sweep.tcpExits
+		if network == N.NetworkUDP {
+			checkedExits = sweep.udpExits
 		}
 	}
+	var firstOutbound adapter.Outbound
+	var currentDelay uint16
+	var currentTested bool
 	for _, detour := range g.outbounds {
 		if !common.Contains(detour.Network(), network) {
 			continue
 		}
-		history := histories.LoadURLTestHistory(RealTag(detour, network))
-		if history == nil {
+		if firstOutbound == nil {
+			firstOutbound = detour
+		}
+		exit := realOutbound(detour, network)
+		if completeSweep {
+			if checkedExit, nested := checkedExits[detour.Tag()]; nested && checkedExit != exit {
+				completeSweep = false
+			}
+		}
+		if exit == nil || !g.probeHistoryMatchesLocked(exit.Tag(), exit) {
 			continue
 		}
-		if minDelay == 0 || uint32(minDelay) > uint32(history.Delay)+uint32(g.tolerance) {
-			minDelay = history.Delay
+		exitTag := exit.Tag()
+		delay, tested := histories.LoadDelay(exitTag, smoothed)
+		if !tested {
+			continue
+		}
+		if applyTolerance && detour == current {
+			currentDelay, currentTested = delay, true
+		}
+		if minOutbound == nil || delay < minDelay {
+			minDelay = delay
 			minOutbound = detour
 		}
 	}
 	if minOutbound == nil {
-		for _, detour := range g.outbounds {
-			if !common.Contains(detour.Network(), network) {
-				continue
-			}
-			return detour, false
-		}
-		return nil, false
+		return firstOutbound, false, completeSweep
 	}
-	return minOutbound, true
+	if !completeSweep && currentTested && uint32(currentDelay) <= uint32(minDelay)+uint32(g.tolerance) {
+		return current, true, false
+	}
+	return minOutbound, true, completeSweep
 }
 
 func (g *URLTestGroup) loopCheck(ticker *time.Ticker) {
@@ -943,12 +1041,28 @@ func (g *URLTestGroup) checkHTTPOutbounds(ctx context.Context, force bool) map[s
 	if force {
 		maxAge = 0
 	}
-	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
+	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](g.probeConcurrency))
 	checked := make(map[string]bool)
-	var resultAccess sync.Mutex
-	for _, detour := range g.snapshotOutbounds() {
+	sweep := &urlTestSweep{outbounds: g.snapshotOutbounds()}
+	for _, detour := range sweep.outbounds {
 		tag := detour.Tag()
-		realTag := MemberTag(detour)
+		exit := realOutbound(detour, N.NetworkTCP)
+		if _, nested := detour.(adapter.OutboundGroup); nested {
+			if sweep.tcpExits == nil {
+				sweep.tcpExits = make(map[string]adapter.Outbound)
+			}
+			sweep.tcpExits[tag] = exit
+			if g.udpProbe == nil && common.Contains(detour.Network(), N.NetworkUDP) {
+				if sweep.udpExits == nil {
+					sweep.udpExits = make(map[string]adapter.Outbound)
+				}
+				sweep.udpExits[tag] = realOutbound(detour, N.NetworkUDP)
+			}
+		}
+		realTag := tag
+		if exit != nil && exit.Tag() != "" {
+			realTag = exit.Tag()
+		}
 		if checked[realTag] {
 			continue
 		}
@@ -957,12 +1071,13 @@ func (g *URLTestGroup) checkHTTPOutbounds(ctx context.Context, force bool) map[s
 		if !loaded {
 			continue
 		}
-		history := g.history.LoadURLTestHistory(realTag)
-		if !force && history != nil && time.Since(history.Time) < maxAge {
-			continue
-		}
 		b.Go(realTag, func() (any, error) {
-			t, at, err := g.coordinator.Check(ctx, g.link, g.expectedStatus, realTag, p, C.TCPTimeout, maxAge)
+			g.history.BeginProbe(realTag)
+			defer g.history.EndProbe(realTag)
+			g.sharedHistory.BeginProbe(realTag)
+			defer g.sharedHistory.EndProbe(realTag)
+
+			t, at, err := g.coordinator.CheckOutbound(ctx, g.link, g.expectedStatus, realTag, p, g.probeTimeout, maxAge)
 			if err != nil && ctx.Err() != nil {
 				// Running out of the caller's time says nothing about the member,
 				// so its history stays.
@@ -970,23 +1085,35 @@ func (g *URLTestGroup) checkHTTPOutbounds(ctx context.Context, force bool) map[s
 			}
 			if err != nil {
 				g.logger.Debug("outbound ", tag, " unavailable: ", err)
-				g.deleteHistory(realTag)
 			} else {
 				g.logger.Debug("outbound ", tag, " available: ", t, "ms")
-				g.storeHistory(realTag, &adapter.URLTestHistory{
+			}
+			g.access.Lock()
+			defer g.access.Unlock()
+			// The result belongs to the outbound that was actually tested.
+			if current, loaded := g.outbound.Outbound(realTag); !loaded || (reflect.ValueOf(p).Comparable() && current != p) {
+				return nil, nil
+			}
+			g.rememberProbeOutboundLocked(realTag, p, nil)
+			if err != nil {
+				g.history.DeleteURLTestHistoryAt(realTag, at)
+				g.sharedHistory.DeleteURLTestHistoryAt(realTag, at)
+			} else {
+				g.storeHistoryLocked(realTag, &adapter.URLTestHistory{
 					Time:  at,
 					Delay: t,
 				})
-				resultAccess.Lock()
 				result[tag] = t
-				resultAccess.Unlock()
 			}
 			return nil, nil
 		})
 	}
 	b.Wait()
 	if g.ctx.Err() == nil {
-		g.updateSelection(true, g.udpProbe == nil)
+		if ctx.Err() != nil {
+			sweep = nil
+		}
+		g.updateSelection(true, g.udpProbe == nil, sweep)
 	}
 	return result
 }
@@ -999,22 +1126,36 @@ func (g *URLTestGroup) checkUDPOutbounds(ctx context.Context, force bool) {
 		defer g.checkingUDP.Store(false)
 	}
 	maxAge := freshFor(g.interval)
-	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
+	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](g.probeConcurrency))
 	checked := make(map[string]bool)
-	for _, detour := range g.snapshotOutbounds() {
+	sweep := &urlTestSweep{outbounds: g.snapshotOutbounds()}
+	for _, detour := range sweep.outbounds {
 		if !common.Contains(detour.Network(), N.NetworkUDP) {
 			continue
 		}
-		tag := RealTag(detour, N.NetworkUDP)
+		exit := realOutbound(detour, N.NetworkUDP)
+		if _, nested := detour.(adapter.OutboundGroup); nested {
+			if sweep.udpExits == nil {
+				sweep.udpExits = make(map[string]adapter.Outbound)
+			}
+			sweep.udpExits[detour.Tag()] = exit
+		}
+		if exit == nil {
+			continue
+		}
+		tag := exit.Tag()
 		if tag == "" || checked[tag] {
 			continue
 		}
 		checked[tag] = true
-		history := g.udpHistory.LoadURLTestHistory(tag)
-		if !force && history != nil && time.Since(history.Time) < maxAge {
-			continue
-		}
 		if outbound, loaded := g.outbound.Outbound(tag); loaded {
+			g.access.RLock()
+			history := g.udpHistory.LoadURLTestHistory(tag)
+			fresh := history != nil && time.Since(history.Time) < maxAge && g.probeHistoryMatchesLocked(tag, outbound)
+			g.access.RUnlock()
+			if !force && fresh {
+				continue
+			}
 			b.Go(tag, func() (any, error) {
 				g.checkUDP(ctx, tag, outbound)
 				return nil, nil
@@ -1023,7 +1164,10 @@ func (g *URLTestGroup) checkUDPOutbounds(ctx context.Context, force bool) {
 	}
 	b.Wait()
 	if g.ctx.Err() == nil {
-		g.updateSelection(false, true)
+		if ctx.Err() != nil {
+			sweep = nil
+		}
+		g.updateSelection(false, true, sweep)
 	}
 }
 
@@ -1042,7 +1186,7 @@ func (g *URLTestGroup) checkUDP(ctx context.Context, tag string, detour adapter.
 	sequence := checks.started
 	g.access.Unlock()
 
-	delay, at, err := g.coordinator.CheckUDP(ctx, g.udpProbe, tag, detour, C.TCPTimeout)
+	delay, at, err := g.coordinator.CheckUDP(ctx, g.udpProbe, tag, detour, g.probeTimeout)
 	g.access.Lock()
 	defer g.access.Unlock()
 	checks.active--
@@ -1053,7 +1197,11 @@ func (g *URLTestGroup) checkUDP(ctx context.Context, tag string, detour adapter.
 	if ctx.Err() != nil || sequence < checks.applied {
 		return
 	}
+	if current, loaded := g.outbound.Outbound(tag); !loaded || (reflect.ValueOf(detour).Comparable() && current != detour) {
+		return
+	}
 	checks.applied = sequence
+	g.rememberProbeOutboundLocked(tag, detour, nil)
 	if err != nil {
 		g.udpHistory.DeleteURLTestHistory(tag)
 		g.logger.Debug("UDP probe for ", tag, " failed: ", err)
@@ -1167,10 +1315,10 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 }
 
 func (g *URLTestGroup) performUpdateCheck() {
-	g.updateSelection(true, true)
+	g.updateSelection(true, true, nil)
 }
 
-func (g *URLTestGroup) updateSelection(tcp, udp bool) {
+func (g *URLTestGroup) updateSelection(tcp, udp bool, sweep *urlTestSweep) {
 	g.access.Lock()
 	var (
 		tcpChanged bool
@@ -1178,7 +1326,9 @@ func (g *URLTestGroup) updateSelection(tcp, udp bool) {
 		selected   bool
 	)
 	if tcp {
-		if outbound, exists := g.selectOutbound(N.NetworkTCP); outbound != nil && (g.selectedOutboundTCP == nil || (exists && outbound != g.selectedOutboundTCP)) {
+		outbound, exists, completeSweep := g.selectOutbound(N.NetworkTCP, true, sweep)
+		g.initialTCPSweepDone = g.initialTCPSweepDone || (completeSweep && exists)
+		if outbound != nil && (g.selectedOutboundTCP == nil || (exists && outbound != g.selectedOutboundTCP)) {
 			tcpChanged = g.selectedOutboundTCP != nil && g.selectedOutboundTCP.Tag() != outbound.Tag()
 			g.selectedOutboundTCP = outbound
 			g.initialTCPReady = g.initialTCPReady || exists
@@ -1186,7 +1336,8 @@ func (g *URLTestGroup) updateSelection(tcp, udp bool) {
 		}
 	}
 	if udp {
-		outbound, exists := g.selectOutbound(N.NetworkUDP)
+		outbound, exists, completeSweep := g.selectOutbound(N.NetworkUDP, true, sweep)
+		g.initialUDPSweepDone = g.initialUDPSweepDone || (completeSweep && exists)
 		if g.udpProbe != nil && !exists {
 			udpChanged = g.selectedOutboundUDP != nil
 			g.selectedOutboundUDP = nil

@@ -21,12 +21,20 @@ import (
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
 
 	"github.com/miekg/dns"
 )
+
+func (g *URLTestGroup) storeHistory(tag string, history *adapter.URLTestHistory) {
+	g.access.Lock()
+	defer g.access.Unlock()
+	g.storeHistoryLocked(tag, history)
+}
 
 func TestURLTestGroupHistoryIsIsolated(t *testing.T) {
 	sharedHistory := urltest.NewHistoryStorage()
@@ -42,7 +50,8 @@ func TestURLTestGroupHistoryIsIsolated(t *testing.T) {
 
 	first.storeHistory("node", &adapter.URLTestHistory{Time: time.Now(), Delay: 10})
 	second.storeHistory("node", &adapter.URLTestHistory{Time: time.Now(), Delay: 20})
-	second.deleteHistory("node")
+	second.history.DeleteURLTestHistory("node")
+	sharedHistory.DeleteURLTestHistory("node")
 
 	if history := first.history.LoadURLTestHistory("node"); history == nil || history.Delay != 10 {
 		t.Fatal("one URLTest group deleted another group's history")
@@ -827,6 +836,10 @@ func TestURLTestKeepsTheNewerUDPProbeResult(t *testing.T) {
 				group.checkUDP(t.Context(), member.Tag(), member)
 			}()
 			<-started
+			group.outbound.(*testOutboundManager).outbounds[member.Tag()] = replacement
+			group.access.Lock()
+			group.outbounds = []adapter.Outbound{replacement}
+			group.access.Unlock()
 			group.checkUDP(t.Context(), replacement.Tag(), replacement)
 			_, tested := group.Select(N.NetworkUDP)
 			close(release)
@@ -838,6 +851,125 @@ func TestURLTestKeepsTheNewerUDPProbeResult(t *testing.T) {
 				t.Fatalf("older UDP probe changed tested to %t, want %t", tested, olderFailed)
 			}
 		})
+	}
+}
+
+func TestURLTestProviderReplacementResetsProbeHistory(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		oldStarted, releaseOld := make(chan struct{}), make(chan struct{})
+		newStarted, releaseNew := make(chan struct{}), make(chan struct{})
+		old := &udpProbeTestOutbound{
+			fallbackHealthTestOutbound: newFallbackHealthTestOutbound("provider/node", true),
+			beforeUDP: func(context.Context, M.Socksaddr) error {
+				close(oldStarted)
+				<-releaseOld
+				return nil
+			},
+		}
+		replacement := &udpProbeTestOutbound{
+			fallbackHealthTestOutbound: newFallbackHealthTestOutbound(old.Tag(), true),
+			beforeUDP: func(context.Context, M.Socksaddr) error {
+				close(newStarted)
+				<-releaseNew
+				return nil
+			},
+		}
+		outbound := newDialTestURLTest(t, old)
+		defer outbound.Close()
+		provider := &testProvider{tag: "provider", outbounds: []adapter.Outbound{replacement}}
+		outbound.providers = map[string]adapter.Provider{provider.Tag(): provider}
+		outbound.providerTags = []string{provider.Tag()}
+		outbound.outboundsCache = make(map[string][]adapter.Outbound)
+		group := outbound.group
+		enableTestUDPProbe(t, group)
+		for _, delay := range []uint16{10, 20, 30} {
+			time.Sleep(time.Millisecond)
+			history := &adapter.URLTestHistory{Time: time.Now(), Delay: delay}
+			group.storeHistory(old.Tag(), history)
+			group.udpHistory.StoreURLTestHistory(old.Tag(), history)
+		}
+		oldDone := make(chan struct{})
+		go func() {
+			defer close(oldDone)
+			group.checkUDP(t.Context(), old.Tag(), old)
+		}()
+		<-oldStarted
+		outbound.outbound.(*testOutboundManager).outbounds[old.Tag()] = replacement
+		if err := outbound.onProviderUpdated(provider.Tag()); err != nil {
+			t.Fatal(err)
+		}
+		<-newStarted
+		close(releaseOld)
+		<-oldDone
+		if history := group.udpHistory.LoadURLTestHistory(old.Tag()); history != nil {
+			t.Errorf("UDP history before replacement probe finished = %v, want none", history)
+		}
+		close(releaseNew)
+		synctest.Wait()
+		for network, storage := range map[string]*urltest.HistoryStorage{N.NetworkTCP: group.history, N.NetworkUDP: group.udpHistory} {
+			if delay, tested := storage.LoadDelay(replacement.Tag(), true); !tested || delay != 1 {
+				t.Errorf("%s delay after first replacement probe = %d, tested = %t, want 1 and true", network, delay, tested)
+			}
+		}
+	})
+}
+
+func TestURLTestCanceledTCPDialKeepsProbeResult(t *testing.T) {
+	member := &fallbackBlockingOutbound{
+		Adapter: outboundAdapter.NewAdapter(C.TypeVLESS, "blocking", []string{N.NetworkTCP}, nil),
+		started: make(chan struct{}),
+	}
+	outbound := newDialTestURLTest(t, member)
+	group := outbound.group
+	measuredAt := group.history.LoadURLTestHistory(member.Tag()).Time
+	for _, delay := range []uint16{40, 30, 50} {
+		measuredAt = measuredAt.Add(time.Nanosecond)
+		group.storeHistory(member.Tag(), &adapter.URLTestHistory{Time: measuredAt, Delay: delay})
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() {
+		select {
+		case <-member.started:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	if _, err := outbound.DialContext(ctx, N.NetworkTCP, M.Socksaddr{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("dial returned %v, want context.Canceled", err)
+	}
+	if delay, tested := group.history.LoadDelay(member.Tag(), true); !tested || delay != 40 {
+		t.Fatalf("smoothed delay after canceled dial = %d, tested = %t, want 40 and true", delay, tested)
+	}
+	if raw := group.sharedHistory.LoadURLTestHistory(member.Tag()); raw == nil || raw.Delay != 50 {
+		t.Fatalf("dashboard result after canceled dial = %v, want 50 ms", raw)
+	}
+}
+
+func TestURLTestTCPFailureKeepsProbeUpdatedDuringDial(t *testing.T) {
+	member := newFallbackHealthTestOutbound("member", true)
+	outbound := newDialTestURLTest(t, member)
+	group := outbound.group
+	defer group.Close()
+	old := group.history.LoadURLTestHistory(member.Tag())
+	dialErr := errors.New("TCP dial failed")
+	var fresh *adapter.URLTestHistory
+	_, err := openURLTestConnection(t.Context(), outbound, N.NetworkTCP, func(ctx context.Context, _ adapter.Outbound) (net.Conn, error) {
+		group.checkHTTPOutbounds(ctx, true)
+		fresh = group.history.LoadURLTestHistory(member.Tag())
+		return nil, dialErr
+	}, (*interrupt.Group).NewConn)
+	if !errors.Is(err, dialErr) {
+		t.Fatalf("TCP dial returned %v, want %v", err, dialErr)
+	}
+	if fresh == nil || fresh == old {
+		t.Fatal("TCP probe did not publish a fresh result")
+	}
+	if got := group.history.LoadURLTestHistory(member.Tag()); got != fresh {
+		t.Errorf("local result after failed dial = %v, want %v", got, fresh)
+	}
+	if got := group.sharedHistory.LoadURLTestHistory(member.Tag()); got != fresh {
+		t.Errorf("dashboard result after failed dial = %v, want %v", got, fresh)
 	}
 }
 
@@ -1046,12 +1178,13 @@ func (m *queuedURLTestManager) Outbound(tag string) (adapter.Outbound, bool) {
 
 type delayedURLTestOutbound struct {
 	*fallbackHealthTestOutbound
+	delay time.Duration
 }
 
 func (o *delayedURLTestOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	if destination.IsDomain() {
 		select {
-		case <-time.After(time.Millisecond):
+		case <-time.After(o.delay):
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -1078,7 +1211,7 @@ func TestURLTestInitialSelectionWaitsForQueuedMembers(t *testing.T) {
 			outbounds = append(outbounds, node)
 			manager.outbounds[node.Tag()] = node
 		}
-		working := &delayedURLTestOutbound{newFallbackHealthTestOutbound("working", true)}
+		working := &delayedURLTestOutbound{fallbackHealthTestOutbound: newFallbackHealthTestOutbound("working", true), delay: time.Millisecond}
 		outbounds = append(outbounds, working)
 		manager.outbounds[working.Tag()] = working
 		group, err := NewURLTestGroup(ctx, manager, log.NewNOPFactory().NewLogger("test"), outbounds, "http://health.test/", nil, 0, 0, 0, false)
@@ -1160,6 +1293,204 @@ func TestURLTestInitialSelectionBootstrapsDNS(t *testing.T) {
 	}
 }
 
+func TestURLTestProbeLimits(t *testing.T) {
+	for _, network := range []string{N.NetworkTCP, N.NetworkUDP} {
+		t.Run(network, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				manager := &testOutboundManager{outbounds: make(map[string]adapter.Outbound)}
+				var options option.URLTestOutboundOptions
+				for index := range 3 {
+					tag := fmt.Sprint("stalled-", index)
+					manager.outbounds[tag] = &fallbackBlockingOutbound{
+						Adapter: outboundAdapter.NewAdapter("test", tag, []string{network}, nil),
+						started: make(chan struct{}),
+					}
+					options.Outbounds = append(options.Outbounds, tag)
+				}
+				options.URL = "http://health.test/"
+				options.Timeout = badoption.Duration(2 * time.Second)
+				options.Concurrency = 2
+				if network == N.NetworkUDP {
+					options.UDPProbe = &option.URLTestUDPProbe{
+						ServerOptions: option.ServerOptions{Server: "192.0.2.53"},
+						Domain:        "health.test",
+					}
+				}
+				ctx := service.ContextWith[adapter.OutboundManager](t.Context(), manager)
+				outbound, err := NewURLTest(ctx, nil, log.NewNOPFactory().NewLogger("test"), "group", options)
+				if err != nil {
+					t.Fatal(err)
+				}
+				group := outbound.(*URLTest)
+				if err = group.start(); err != nil {
+					t.Fatal(err)
+				}
+				defer group.Close()
+				started := time.Now()
+				if network == N.NetworkTCP {
+					group.group.checkHTTPOutbounds(ctx, true)
+				} else {
+					group.group.checkUDPOutbounds(ctx, true)
+				}
+				if elapsed := time.Since(started); elapsed != 4*time.Second {
+					t.Fatalf("three probes with concurrency 2 and timeout 2s took %v, want 4s", elapsed)
+				}
+			})
+		})
+	}
+}
+
+func TestURLTestAppliesToleranceAfterFirstCompleteSweep(t *testing.T) {
+	for _, network := range []string{N.NetworkTCP, N.NetworkUDP} {
+		t.Run(network, func(t *testing.T) {
+			early := newTestOutbound("early")
+			middle := newTestOutbound("middle")
+			fastest := newTestOutbound("fastest")
+			members := []adapter.Outbound{early, middle, fastest}
+			group, err := NewURLTestGroup(
+				t.Context(), nil, nil, members, "", nil, 0, 50, 0, false,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			history := group.history
+			if network == N.NetworkUDP {
+				enableTestUDPProbe(t, group)
+				history = group.udpHistory
+			}
+			measuredAt := time.Now()
+			store := func(member adapter.Outbound, delay uint16) {
+				measuredAt = measuredAt.Add(time.Second)
+				history.StoreURLTestHistory(member.Tag(), &adapter.URLTestHistory{Time: measuredAt, Delay: delay})
+			}
+			outbound := &URLTest{group: group}
+			assertSelected := func(want adapter.Outbound) {
+				t.Helper()
+				if got := outbound.Selected(network); got != want {
+					t.Fatalf("selected %v, want %s", got, want.Tag())
+				}
+			}
+			update := func(checked []adapter.Outbound) {
+				var sweep *urlTestSweep
+				if checked != nil {
+					sweep = &urlTestSweep{outbounds: checked}
+				}
+				group.updateSelection(network == N.NetworkTCP, network == N.NetworkUDP, sweep)
+			}
+
+			store(early, 65)
+			selection, err := group.selectForDial(t.Context(), network)
+			if err != nil || selection.outbound != early {
+				t.Fatalf("early dial selected %v, %v, want early", selection.outbound, err)
+			}
+			store(middle, 60)
+			store(fastest, 90)
+			store(fastest, 90)
+			store(fastest, 54)
+			update(nil)
+			assertSelected(early)
+			update(members)
+			assertSelected(fastest)
+
+			store(middle, 54)
+			store(fastest, 104)
+			update(members)
+			assertSelected(fastest)
+
+			store(fastest, 130)
+			update(members)
+			assertSelected(fastest)
+			history.StoreURLTestHistory(fastest.Tag(), &adapter.URLTestHistory{Time: measuredAt, Delay: 130})
+			update(members)
+			assertSelected(fastest)
+
+			store(fastest, 131)
+			update(members)
+			assertSelected(middle)
+
+			history.DeleteURLTestHistory(middle.Tag())
+			update(members)
+			assertSelected(early)
+		})
+	}
+}
+
+func TestURLTestFirstSweepChecksTheCurrentNestedExit(t *testing.T) {
+	for _, network := range []string{N.NetworkTCP, N.NetworkUDP} {
+		t.Run(network, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				stalled := &fallbackBlockingOutbound{
+					Adapter: outboundAdapter.NewAdapter("test", "stalled", []string{network}, nil),
+					started: make(chan struct{}),
+				}
+				fastest := &udpProbeTestOutbound{fallbackHealthTestOutbound: newFallbackHealthTestOutbound("fastest", true)}
+				slowerBase := newFallbackHealthTestOutbound("slower", true)
+				var slower adapter.Outbound = &delayedURLTestOutbound{fallbackHealthTestOutbound: slowerBase, delay: 20 * time.Millisecond}
+				if network == N.NetworkUDP {
+					slower = &udpProbeTestOutbound{
+						fallbackHealthTestOutbound: slowerBase,
+						beforeUDP: func(context.Context, M.Socksaddr) error {
+							time.Sleep(20 * time.Millisecond)
+							return nil
+						},
+					}
+				}
+				nestedGroup, err := NewURLTestGroup(
+					t.Context(), nil, nil, []adapter.Outbound{stalled, fastest}, "", nil, 0, 0, 0, false,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer nestedGroup.Close()
+				nested := &URLTest{
+					Adapter: outboundAdapter.NewAdapter(C.TypeURLTest, "nested", []string{network}, nil),
+					group:   nestedGroup,
+				}
+				manager := &testOutboundManager{outbounds: map[string]adapter.Outbound{
+					stalled.Tag(): stalled, fastest.Tag(): fastest, slower.Tag(): slower, nested.Tag(): nested,
+				}}
+				group, err := NewURLTestGroup(
+					t.Context(), manager, log.NewNOPFactory().NewLogger("test"),
+					[]adapter.Outbound{nested, slower}, "http://health.test/", nil, 0, 50, 0, false,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer group.Close()
+				if network == N.NetworkUDP {
+					enableTestUDPProbe(t, group)
+				}
+				check := func() {
+					if network == N.NetworkTCP {
+						group.checkHTTPOutbounds(t.Context(), true)
+					} else {
+						group.checkUDPOutbounds(t.Context(), true)
+					}
+				}
+				firstSweepDone := make(chan struct{})
+				go func() {
+					check()
+					close(firstSweepDone)
+				}()
+				<-stalled.started
+				synctest.Wait()
+				nestedGroup.storeHistory(fastest.Tag(), &adapter.URLTestHistory{Time: time.Now(), Delay: 1})
+				nestedGroup.performUpdateCheck()
+				<-firstSweepDone
+				outbound := &URLTest{group: group}
+				if selected := outbound.Selected(network); selected != slower {
+					t.Fatalf("incomplete sweep selected %v, want slower", selected)
+				}
+
+				check()
+				if selected := outbound.Selected(network); selected != nested {
+					t.Fatalf("first complete sweep selected %v, want nested", selected)
+				}
+			})
+		})
+	}
+}
+
 // A tolerance near the uint16 limit means "keep the selected member"; a sum
 // that wrapped around would read as a lower delay and switch to a slower one.
 func TestURLTestToleranceDoesNotWrapAround(t *testing.T) {
@@ -1203,6 +1534,99 @@ func TestURLTestGroupUsesExpectedStatus(t *testing.T) {
 	if result, err := group.URLTest(context.Background()); err != nil || len(result) != 1 {
 		t.Fatalf("unexpected accepted result: %v, %v", result, err)
 	}
+}
+
+type urlTestProbeLogger struct {
+	log.ContextLogger
+	message string
+	paused  chan<- struct{}
+	release <-chan struct{}
+}
+
+func (l *urlTestProbeLogger) Debug(args ...any) {
+	if strings.Contains(fmt.Sprint(args...), l.message) {
+		close(l.paused)
+		<-l.release
+	}
+}
+
+func TestURLTestOlderTCPProbeFailureKeepsNewerSuccess(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		node := newFallbackHealthTestOutbound("node", false)
+		manager := &testOutboundManager{outbounds: map[string]adapter.Outbound{node.Tag(): node}}
+		failed := make(chan struct{})
+		release := make(chan struct{})
+		logger := &urlTestProbeLogger{ContextLogger: log.NewNOPFactory().NewLogger("test"), message: " unavailable: ", paused: failed, release: release}
+		group, err := NewURLTestGroup(
+			t.Context(), manager, logger, []adapter.Outbound{node}, "http://health.test/", nil, 0, 0, 0, false,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer group.Close()
+		group.storeHistory(node.Tag(), &adapter.URLTestHistory{Time: time.Now().Add(-2 * time.Second), Delay: 25})
+		group.storeHistory(node.Tag(), &adapter.URLTestHistory{Time: time.Now().Add(-time.Second), Delay: 30})
+
+		olderSweepDone := make(chan struct{})
+		go func() {
+			defer close(olderSweepDone)
+			group.checkHTTPOutbounds(t.Context(), true)
+		}()
+		<-failed
+		node.setAvailable(true)
+		time.Sleep(time.Millisecond)
+		result := group.checkHTTPOutbounds(t.Context(), true)
+		close(release)
+		<-olderSweepDone
+
+		if result[node.Tag()] != 1 {
+			t.Fatalf("newer sweep returned %v, want 1 ms for %s", result, node.Tag())
+		}
+		if delay, tested := group.history.LoadDelay(node.Tag(), true); !tested || delay != 25 {
+			t.Fatalf("smoothed delay after older failure = %d, tested = %t, want 25 and true", delay, tested)
+		}
+		if raw := group.sharedHistory.LoadURLTestHistory(node.Tag()); raw == nil || raw.Delay != 1 {
+			t.Fatalf("dashboard result after older failure = %v, want 1 ms", raw)
+		}
+	})
+}
+
+func TestURLTestOlderTCPSuccessKeepsNewerFailure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		node := newFallbackHealthTestOutbound("node", true)
+		manager := &testOutboundManager{outbounds: map[string]adapter.Outbound{node.Tag(): node}}
+		paused := make(chan struct{})
+		release := make(chan struct{})
+		logger := &urlTestProbeLogger{ContextLogger: log.NewNOPFactory().NewLogger("test"), message: " available: ", paused: paused, release: release}
+		group, err := NewURLTestGroup(
+			t.Context(), manager, logger, []adapter.Outbound{node}, "http://health.test/", nil, 0, 0, 0, false,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer group.Close()
+		olderSweepDone := make(chan struct{})
+		go func() {
+			defer close(olderSweepDone)
+			group.checkHTTPOutbounds(t.Context(), true)
+		}()
+		<-paused
+		node.setAvailable(false)
+		time.Sleep(time.Millisecond)
+		result := group.checkHTTPOutbounds(t.Context(), true)
+		close(release)
+		<-olderSweepDone
+
+		if len(result) != 0 {
+			t.Fatalf("newer failed sweep returned %v, want no delays", result)
+		}
+		if local := group.history.LoadURLTestHistory(node.Tag()); local != nil {
+			t.Fatalf("local result after newer failure = %v, want no delay", local)
+		}
+		if raw := group.sharedHistory.LoadURLTestHistory(node.Tag()); raw != nil {
+			t.Fatalf("dashboard result after newer failure = %v, want no delay", raw)
+		}
+	})
 }
 
 type urlTestWarningLogger struct {

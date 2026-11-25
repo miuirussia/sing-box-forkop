@@ -33,6 +33,7 @@ type coordinatorKey struct {
 	link           string
 	expectedStatus string
 	timeout        time.Duration
+	outbound       any
 }
 
 type udpCoordinatorKey struct {
@@ -63,9 +64,23 @@ func NewCoordinator() *Coordinator {
 // force a fresh test. It returns the delay and the time the returned result was
 // produced, so callers can store an accurate history record.
 func (c *Coordinator) Check(ctx context.Context, link string, expectedStatus ExpectedStatus, tag string, detour N.Dialer, timeout time.Duration, maxAge time.Duration) (uint16, time.Time, error) {
-	key := coordinatorKey{tag: tag, link: link, expectedStatus: expectedStatusKey(expectedStatus), timeout: timeout}
-	return coordinate(ctx, c, c.checks, key, timeout, maxAge, true, func(testCtx context.Context) (uint16, error) {
-		return URLTestWithExpectedStatus(testCtx, link, detour, expectedStatus)
+	return c.checkHTTP(ctx, link, expectedStatus, tag, detour, timeout, maxAge, nil)
+}
+
+// CheckOutbound shares results only for the same detour. Providers can replace
+// an outbound while keeping its tag.
+func (c *Coordinator) CheckOutbound(ctx context.Context, link string, expectedStatus ExpectedStatus, tag string, detour N.Dialer, timeout time.Duration, maxAge time.Duration) (uint16, time.Time, error) {
+	return c.checkHTTP(ctx, link, expectedStatus, tag, detour, timeout, maxAge, detour)
+}
+
+func (c *Coordinator) checkHTTP(ctx context.Context, link string, expectedStatus ExpectedStatus, tag string, detour N.Dialer, timeout time.Duration, maxAge time.Duration, identity any) (uint16, time.Time, error) {
+	retain := identity == nil || reflect.ValueOf(identity).Comparable()
+	if !retain {
+		identity = new(byte)
+	}
+	key := coordinatorKey{tag: tag, link: link, expectedStatus: expectedStatusKey(expectedStatus), timeout: timeout, outbound: identity}
+	return coordinate(ctx, c, c.checks, key, timeout, maxAge, retain, func(testCtx context.Context) (uint16, error) {
+		return urlTestWithTimeout(testCtx, link, detour, expectedStatus, timeout)
 	})
 }
 

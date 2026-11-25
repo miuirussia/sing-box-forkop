@@ -77,6 +77,22 @@ func TestCoordinatorReusesFreshResults(t *testing.T) {
 	}
 }
 
+func TestCoordinatorProbesReplacementWithSameTag(t *testing.T) {
+	first := &coordinatorTestDialer{}
+	replacement := &coordinatorTestDialer{}
+	coordinator := NewCoordinator()
+	const link = "http://health.test/generate_204"
+	if _, _, err := coordinator.CheckOutbound(t.Context(), link, nil, "node", first, time.Second, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := coordinator.CheckOutbound(t.Context(), link, nil, "node", replacement, time.Second, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if count := replacement.dialCount(); count != 1 {
+		t.Fatalf("replacement was dialed %d times, want 1", count)
+	}
+}
+
 func TestCoordinatorCollapsesConcurrentChecks(t *testing.T) {
 	coordinator := NewCoordinator()
 	dialer := &coordinatorTestDialer{block: make(chan struct{})}

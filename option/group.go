@@ -14,6 +14,8 @@ type URLTestOutboundOptions struct {
 	ExpectedStatus            string             `json:"expected_status,omitempty"`
 	UDPProbe                  *URLTestUDPProbe   `json:"udp_probe,omitempty"`
 	Interval                  badoption.Duration `json:"interval,omitempty"`
+	Timeout                   badoption.Duration `json:"timeout,omitempty"`
+	Concurrency               int                `json:"concurrency,omitempty"`
 	Tolerance                 uint16             `json:"tolerance,omitempty"`
 	IdleTimeout               badoption.Duration `json:"idle_timeout,omitempty"`
 	InterruptExistConnections bool               `json:"interrupt_exist_connections,omitempty"`

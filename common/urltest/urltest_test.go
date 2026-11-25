@@ -10,8 +10,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter"
 	M "github.com/sagernet/sing/common/metadata"
 )
+
+func TestHistoryStorageKeepsNewestRawResult(t *testing.T) {
+	storage := NewHistoryStorage()
+	at := time.Now()
+	newest := &adapter.URLTestHistory{Time: at, Delay: 30}
+	storage.StoreURLTestHistory("node", newest)
+	storage.StoreURLTestHistory("node", &adapter.URLTestHistory{Time: at.Add(-time.Second), Delay: 10})
+	if got := storage.LoadURLTestHistory("node"); got != newest {
+		t.Fatalf("raw result = %v, want %v", got, newest)
+	}
+}
 
 type testDialer struct {
 	address string

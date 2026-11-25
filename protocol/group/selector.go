@@ -297,16 +297,21 @@ func (s *Selector) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 }
 
 func RealTag(detour adapter.Outbound, network string) string {
-	for {
+	if detour = realOutbound(detour, network); detour != nil {
+		return detour.Tag()
+	}
+	return ""
+}
+
+func realOutbound(detour adapter.Outbound, network string) adapter.Outbound {
+	for detour != nil {
 		group, isGroup := detour.(adapter.OutboundGroup)
 		if !isGroup {
-			return detour.Tag()
+			return detour
 		}
 		detour = group.Selected(network)
-		if detour == nil {
-			return ""
-		}
 	}
+	return nil
 }
 
 // MemberTag is the tag the delay of a member is measured and kept under: the outbound the member
