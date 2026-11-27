@@ -171,7 +171,13 @@ func applyTCPChecksum(tcp header.TCP, srcAddr, dstAddr netip.Addr, payload []byt
 	payloadChecksum := checksum.Checksum(payload, 0)
 	tcpChecksum := ^tcp.CalculateChecksum(checksum.Combine(pseudo, payloadChecksum))
 	if corrupt {
-		tcpChecksum ^= 0xFFFF
+		// One's-complement +0 and -0 are equivalent: inverting an all-zero
+		// checksum alone would still validate. Break that special case explicitly.
+		if tcpChecksum == 0 || tcpChecksum == 0xffff {
+			tcpChecksum ^= 1
+		} else {
+			tcpChecksum ^= 0xFFFF
+		}
 	}
 	tcp.SetChecksum(tcpChecksum)
 }

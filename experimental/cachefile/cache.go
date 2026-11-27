@@ -35,6 +35,7 @@ var (
 		string(bucketRuleSetFile),
 		string(bucketRDRC),
 		string(bucketDNSCache),
+		string(bucketDesync),
 	}
 
 	cacheIDDefault = []byte("default")
@@ -43,6 +44,7 @@ var (
 var _ adapter.CacheFile = (*CacheFile)(nil)
 
 type CacheFile struct {
+	desync             desyncPending
 	ctx                context.Context
 	logger             logger.Logger
 	path               string
@@ -155,7 +157,9 @@ func (c *CacheFile) Start(stage adapter.StartStage, scope *adapter.Scope) error 
 			return err
 		}
 		scope.Add(func() error {
-			return c.database().Close()
+			flushErr := c.closeDesync()
+			closeErr := c.database().Close()
+			return errors.Join(flushErr, closeErr)
 		})
 	case adapter.StartStateStart:
 		c.startCacheCleanup()

@@ -1,0 +1,70 @@
+name: Desync correctness
+
+on:
+  pull_request:
+    paths:
+      - 'common/desync/**'
+      - 'common/tlsspoof/**'
+      - 'common/dialer/**'
+      - 'option/**'
+      - 'protocol/desync/**'
+      - 'experimental/cachefile/**'
+      - 'experimental/clashapi/**'
+      - 'include/**'
+      - 'cmd/sing-box/cmd_desync*'
+      - 'constant/proxy.go'
+      - 'tests/desync/**'
+      - '.github/workflows/desync.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'common/desync/**'
+      - 'common/tlsspoof/**'
+      - 'common/dialer/**'
+      - 'option/**'
+      - 'protocol/desync/**'
+      - 'experimental/cachefile/**'
+      - 'experimental/clashapi/**'
+      - 'include/**'
+      - 'cmd/sing-box/cmd_desync*'
+      - 'constant/proxy.go'
+      - 'tests/desync/**'
+      - '.github/workflows/desync.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  correctness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5.0.0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: release/forkop/GO_VERSION
+      - name: Install network tools
+        run: sudo apt-get update && sudo apt-get install -y iproute2 nftables tcpdump openssl
+      - name: Check concurrent stream, UDP and cache behavior
+        run: go test -exec 'sudo -E' -race -tags integration,badlinkname,with_utls,tfogo_checklinkname0,with_clash_api,with_quic -ldflags=-checklinkname=0 ./common/desync ./common/tlsspoof ./common/tlsfragment ./option ./protocol/desync ./experimental/cachefile ./include ./cmd/sing-box ./experimental/clashapi
+      - name: Build the tested core
+        run: go build -tags badlinkname,with_utls,tfogo_checklinkname0,with_clash_api,with_quic -ldflags=-checklinkname=0 -o /tmp/desync-sing-box ./cmd/sing-box
+      - name: Verify all modes through a Linux router
+        run: sudo python3 tests/desync/netns.py --binary /tmp/desync-sing-box --artifacts /tmp/desync-packets/plain
+      - name: Verify NAT and a smaller MTU
+        run: sudo python3 tests/desync/netns.py --binary /tmp/desync-sing-box --nat --mtu 1280 --artifacts /tmp/desync-packets/nat
+      - name: Verify IPv6, SYN options and extension headers
+        run: sudo python3 tests/desync/netns.py --binary /tmp/desync-sing-box --ipv6 --artifacts /tmp/desync-packets/ipv6
+      - name: Cross-build OpenWrt architectures
+        shell: bash
+        run: |
+          for arch in amd64 arm64 mipsle; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" GOMIPS=softfloat go build -tags badlinkname,with_utls,tfogo_checklinkname0,with_clash_api,with_quic -ldflags=-checklinkname=0 -o "/tmp/desync-sing-box-$arch" ./cmd/sing-box
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desync-packets
+          path: /tmp/desync-packets
+          if-no-files-found: ignore

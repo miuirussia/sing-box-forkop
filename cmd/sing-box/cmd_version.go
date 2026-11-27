@@ -30,6 +30,7 @@ func printVersion(cmd *cobra.Command, args []string) {
 		return
 	}
 	version := "sing-box version " + C.Version + "\n\n"
+	version += "Capabilities: forkop-desync-v1\n"
 	version += "Environment: " + runtime.Version() + " " + runtime.GOOS + "/" + runtime.GOARCH + "\n"
 
 	var tags string

@@ -5,6 +5,7 @@ const (
 	TypeRedirect           = "redirect"
 	TypeTProxy             = "tproxy"
 	TypeDirect             = "direct"
+	TypeDesync             = "desync"
 	TypeBridge             = "bridge"
 	TypeBlock              = "block"
 	TypeDNS                = "dns"

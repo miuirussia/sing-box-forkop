@@ -63,18 +63,20 @@ func newRawSpoofer(conn net.Conn, method Method) (rawSpoofer, error) {
 }
 
 func (s *linuxSpoofer) open() error {
-	fd, sockaddr, err := openLinuxRawSocket(s.dst)
-	if err != nil {
-		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
-			return E.Cause(err, "CAP_NET_RAW and CAP_NET_ADMIN are needed (sing-box run as root)")
-		}
-		return err
-	}
-	s.rawFD = fd
-	s.rawSockAddr = sockaddr
-	err = control.Conn(s.tcpConn, func(raw uintptr) error {
-		s.readHopLimit(int(raw))
-		return inheritRouting(fd, int(raw), s.src)
+	err := control.Conn(s.tcpConn, func(raw uintptr) error {
+		return inSocketNamespace(int(raw), func() error {
+			fd, sockaddr, err := openLinuxRawSocket(s.dst)
+			if err != nil {
+				if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+					return E.Cause(err, "CAP_NET_RAW and CAP_NET_ADMIN are needed (sing-box run as root)")
+				}
+				return err
+			}
+			s.rawFD = fd
+			s.rawSockAddr = sockaddr
+			s.readHopLimit(int(raw))
+			return inheritRouting(fd, int(raw), s.src)
+		})
 	})
 	if err != nil {
 		return err

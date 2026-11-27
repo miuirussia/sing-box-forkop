@@ -147,6 +147,7 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		r.Mount("/script", scriptRouter())
 		r.Mount("/profile", profileRouter())
 		r.Mount("/cache", cacheRouter(ctx))
+		r.Mount("/desync", desyncRouter(ctx))
 		r.Mount("/dns", dnsRouter(s.dnsRouter))
 		r.Mount("/tailscale", tailscaleRouter(s.endpoint))
 		r.Post("/geodata/download", s.downloadGeodata)

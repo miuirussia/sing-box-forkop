@@ -152,6 +152,9 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		}
 		dialer.Control = control.Append(dialer.Control, control.BindAddressNoPort())
 	}
+	if options.SocketControl != nil {
+		dialer.Control = control.Append(dialer.Control, options.SocketControl)
+	}
 	if options.ConnectTimeout != 0 {
 		dialer.Timeout = time.Duration(options.ConnectTimeout)
 	} else {
@@ -225,6 +228,12 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 	}
 	if options.TCPMultiPath {
 		dialer4.SetMultipathTCP(true)
+	}
+	if options.SocketControlOwnsBind && options.SocketControl != nil {
+		// The pre-SYN hook has already allocated the TCP source tuple. A
+		// net.Dialer LocalAddr would bind it a second time after Control.
+		dialer4.LocalAddr = nil
+		dialer6.LocalAddr = nil
 	}
 	tcpDialer4 := tfo.Dialer{Dialer: dialer4, DisableTFO: !options.TCPFastOpen}
 	tcpDialer6 := tfo.Dialer{Dialer: dialer6, DisableTFO: !options.TCPFastOpen}

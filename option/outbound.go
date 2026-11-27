@@ -6,6 +6,7 @@ import (
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/schema"
+	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badjson"
@@ -83,6 +84,10 @@ type DialerOptions struct {
 }
 
 type AbstractDialerOptions struct {
+	// SocketControl is an internal pre-connect hook, composed after routing controls.
+	SocketControl control.Func `json:"-"`
+	// SocketControlOwnsBind leaves TCP source binding to SocketControl before connect.
+	SocketControlOwnsBind      bool                              `json:"-"`
 	BindInterface              string                            `json:"bind_interface,omitempty"`
 	Inet4BindAddress           *badoption.Addr                   `json:"inet4_bind_address,omitempty"`
 	Inet6BindAddress           *badoption.Addr                   `json:"inet6_bind_address,omitempty"`
