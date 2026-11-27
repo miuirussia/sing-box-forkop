@@ -68,6 +68,8 @@ func ProxyDisplayName(proxyType string) string {
 		return "TProxy"
 	case TypeDirect:
 		return "Direct"
+	case TypeDesync:
+		return "Desync"
 	case TypeBridge:
 		return "Bridge"
 	case TypeBlock:
