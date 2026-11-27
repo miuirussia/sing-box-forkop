@@ -66,5 +66,7 @@ jobs:
         if: always()
         with:
           name: desync-packets
-          path: /tmp/desync-packets
+          path: |
+            /tmp/desync-packets
+            !/tmp/desync-packets/**/key.pem
           if-no-files-found: ignore
