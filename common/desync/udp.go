@@ -20,6 +20,14 @@ import (
 )
 
 const maxDestinations = 1024
+const maxQUICConnections = 1024
+
+// Client SCID stays stable across server DCID changes and Retry. Empty SCIDs
+// retain a single connection slot per destination for legacy callers/fixtures.
+type initialConnectionKey struct {
+	destination string
+	scid        string
+}
 
 type udpState struct {
 	deadlineMu    sync.Mutex
@@ -29,7 +37,7 @@ type udpState struct {
 	mu            sync.Mutex
 	opts          option.DesyncOptions
 	counts        map[string]uint64
-	quic          map[string]initialState
+	quic          map[initialConnectionKey]initialState
 	first, last   uint64
 	fake          []byte
 	ctx           context.Context
@@ -55,7 +63,7 @@ func newUDPState(ctx context.Context, o option.DesyncOptions, closeConn func() e
 		return nil, err
 	}
 	fake, _ := base64.StdEncoding.DecodeString(o.UDPFakePayload)
-	s := &udpState{ctx: ctx, opts: o, first: first, last: last, fake: fake, counts: make(map[string]uint64), closed: make(chan struct{}), quic: make(map[string]initialState), close: closeConn}
+	s := &udpState{ctx: ctx, opts: o, first: first, last: last, fake: fake, counts: make(map[string]uint64), closed: make(chan struct{}), quic: make(map[initialConnectionKey]initialState), close: closeConn}
 	s.stop = context.AfterFunc(ctx, func() { s.Close() })
 	return s, nil
 }
@@ -85,21 +93,33 @@ func (s *udpState) write(b []byte, key string, addr net.Addr, send func([]byte) 
 	if (s.opts.UDPMode == "stun" || s.opts.UDPMode == "auto") && sniff.STUNMessage(s.ctx, &metadata, b) == nil {
 		kind = "stun"
 	}
-	if kind == "" && (s.opts.QUICDesync == nil || *s.opts.QUICDesync) && (s.opts.UDPMode == "quic" || s.opts.UDPMode == "auto") && quicInitial(b) {
-		// Reuse the sing-box authenticated Initial sniffer. Fragmented CRYPTO is
-		// recognized structurally, while metadata is populated when complete.
-		_ = sniff.QUICClientHello(s.ctx, &metadata, b)
-		kind = "quic"
+	var h initialHeader
+	if kind == "" && (s.opts.QUICDesync == nil || *s.opts.QUICDesync) && (s.opts.UDPMode == "quic" || s.opts.UDPMode == "auto") {
+		var err error
+		h, err = initialPacket(b)
+		if err == nil {
+			kind = "quic"
+		}
 	}
 	wire := b
 	var nextState initialState
-	if kind != "" && s.opts.UDPLen != 0 {
+	var connection initialConnectionKey
+	transformQUIC := kind == "quic" && (s.opts.UDPLen != 0 || s.opts.QUICSplitPos != "" || s.opts.QUICOrder != "")
+	if kind == "stun" && s.opts.UDPLen != 0 {
 		var err error
-		if kind == "stun" {
-			wire, err = padSTUN(b, s.opts.UDPLen)
-		} else {
-			wire, nextState, err = padQUICInitial(b, s.opts.UDPLen, s.quic[key])
+		wire, err = padSTUN(b, s.opts.UDPLen)
+		if err != nil {
+			return 0, err
 		}
+	} else if transformQUIC {
+		connection = initialConnectionKey{destination: key, scid: string(h.scid)}
+		state, exists := s.quic[connection]
+		// Never evict a live connection's original Initial keys to admit another.
+		if !exists && len(s.quic) >= maxQUICConnections {
+			return 0, fmt.Errorf("desync: QUIC connection limit (%d) reached", maxQUICConnections)
+		}
+		var err error
+		wire, nextState, err = transformQUICInitial(b, s.opts.UDPLen, s.opts.QUICSplitPos, s.opts.QUICOrder, state)
 		if err != nil {
 			return 0, err
 		}
@@ -174,8 +194,8 @@ func (s *udpState) write(b []byte, key string, addr net.Addr, send func([]byte) 
 	if n != len(wire) {
 		return 0, fmt.Errorf("desync: partial UDP datagram")
 	}
-	if kind == "quic" && s.opts.UDPLen != 0 {
-		s.quic[key] = nextState
+	if transformQUIC {
+		s.quic[connection] = nextState
 	}
 	return len(b), nil
 }

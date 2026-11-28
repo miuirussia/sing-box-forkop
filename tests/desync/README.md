@@ -50,3 +50,7 @@ pcaps; otherwise temporary files are removed automatically.
 
 These tests establish transport correctness and socket behavior. Effectiveness
 against a particular provider's filtering needs a separate test on that network.
+
+The advanced checks also exercise independent TLS/TCP boundaries, explicit
+segment permutations, hostname-last ordering, interleaved randomized/padded fake
+bursts, and length-preserving host decoys with mandatory invalid checksums.

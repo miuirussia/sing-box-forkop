@@ -71,7 +71,7 @@ func (c *adaptiveConn) expireProbeLocked() {
 	if !c.observed && c.reading && !c.replacing && !c.writing && c.initialWriteDone && ReplayableClientHello(c.flight) && c.ctx.Err() == nil &&
 		(c.readDeadline.IsZero() || time.Now().Before(c.readDeadline)) &&
 		(c.writeDeadline.IsZero() || time.Now().Before(c.writeDeadline)) {
-		c.adaptive.observe(c.keys, c.candidates[c.index].Mode, "initial probe budget exhausted", false, time.Since(c.started))
+		c.adaptive.observe(c.keys, strategyID(c.candidates[c.index]), "initial probe budget exhausted", false, time.Since(c.started))
 	}
 	c.probeExpired = true
 	c.observed = true
@@ -111,7 +111,7 @@ func (c *adaptiveConn) Read(p []byte) (int, error) {
 				if len(c.flight) > 0 && p[0] == 21 {
 					reason, success = "TLS alert", false
 				}
-				c.adaptive.observe(c.keys, c.candidates[c.index].Mode, reason, success, time.Since(c.started))
+				c.adaptive.observe(c.keys, strategyID(c.candidates[c.index]), reason, success, time.Since(c.started))
 				c.observed = true
 			}
 			c.sealed = true
@@ -128,7 +128,7 @@ func (c *adaptiveConn) Read(p []byte) (int, error) {
 				c.slowSamples = 0
 			}
 			if c.slowSamples == 3 && !c.probeExpired && !c.closed && c.ctx.Err() == nil {
-				c.adaptive.observe(c.keys, c.candidates[c.index].Mode, "three active slow-read observations", false, elapsed)
+				c.adaptive.observe(c.keys, strategyID(c.candidates[c.index]), "three active slow-read observations", false, elapsed)
 			}
 			c.lastRead = time.Now()
 			c.sampledWriteBytes = c.writeBytes
@@ -141,7 +141,7 @@ func (c *adaptiveConn) Read(p []byte) (int, error) {
 		}
 		if c.sealed {
 			if !c.observed && !c.closed && c.ctx.Err() == nil {
-				c.adaptive.observe(c.keys, c.candidates[c.index].Mode, "early read: "+err.Error(), false, time.Since(c.started))
+				c.adaptive.observe(c.keys, strategyID(c.candidates[c.index]), "early read: "+err.Error(), false, time.Since(c.started))
 				c.observed = true
 			}
 			if !errors.Is(err, io.EOF) && !c.probeExpired && !c.closed && c.ctx.Err() == nil && c.readBytes > 0 {
@@ -153,10 +153,10 @@ func (c *adaptiveConn) Read(p []byte) (int, error) {
 						c.slowSamples = 0
 					}
 					if c.slowSamples == 3 {
-						c.adaptive.observe(c.keys, c.candidates[c.index].Mode, "three active stalled-read observations", false, 0)
+						c.adaptive.observe(c.keys, strategyID(c.candidates[c.index]), "three active stalled-read observations", false, 0)
 					}
 				} else {
-					c.adaptive.observe(c.keys, c.candidates[c.index].Mode, "stream: "+err.Error(), false, 0)
+					c.adaptive.observe(c.keys, strategyID(c.candidates[c.index]), "stream: "+err.Error(), false, 0)
 				}
 			}
 			c.mu.Unlock()
@@ -169,7 +169,7 @@ func (c *adaptiveConn) Read(p []byte) (int, error) {
 		c.expireProbeLocked()
 		eligible := !c.closed && !c.sealed && ReplayableClientHello(c.flight) && c.index+1 < c.attempts && c.index+1 < len(c.candidates) && time.Now().Before(c.deadline) && c.ctx.Err() == nil && (c.readDeadline.IsZero() || time.Now().Before(c.readDeadline))
 		if !c.observed && !c.closed && c.ctx.Err() == nil {
-			c.adaptive.observe(c.keys, c.candidates[c.index].Mode, "early read: "+err.Error(), false, time.Since(c.started))
+			c.adaptive.observe(c.keys, strategyID(c.candidates[c.index]), "early read: "+err.Error(), false, time.Since(c.started))
 			c.observed = true
 		}
 		if !eligible {
@@ -239,7 +239,7 @@ func (c *adaptiveConn) Read(p []byte) (int, error) {
 			c.mu.Lock()
 			c.expireProbeLocked()
 			if !c.observed && !c.probeExpired && !c.closed && c.ctx.Err() == nil {
-				c.adaptive.observe(c.keys, opts.Mode, "retry: "+dialErr.Error(), false, 0)
+				c.adaptive.observe(c.keys, strategyID(opts), "retry: "+dialErr.Error(), false, 0)
 			}
 			c.observed = true
 			c.sealed = true
@@ -337,7 +337,7 @@ func (c *adaptiveConn) Write(p []byte) (int, error) {
 		c.releaseLocked()
 		_ = conn.SetReadDeadline(c.effectiveReadDeadlineLocked())
 		if !c.observed && !c.closed && c.ctx.Err() == nil && err != nil {
-			c.adaptive.observe(c.keys, c.candidates[c.index].Mode, "write: "+err.Error(), false, 0)
+			c.adaptive.observe(c.keys, strategyID(c.candidates[c.index]), "write: "+err.Error(), false, 0)
 			c.observed = true
 		}
 	}

@@ -21,6 +21,15 @@ func (n partitionNetwork) NetworkInterfaces() []adapter.NetworkInterface {
 	return []adapter.NetworkInterface{{Interface: control.Interface{Addresses: []netip.Prefix{netip.MustParsePrefix("192.0.2.1/24")}}}}
 }
 
+func TestManualStrategyDiagnostics(t *testing.T) {
+	options := strategyForTest(t, `{"mode":"split","split_pos":"1","delay":"5ms"}`)
+	out := &Outbound{options: options}
+	stats := out.DesyncStats()
+	if stats.Version != 1 || stats.Current != strategyID(options) || stats.Reason != "manual strategy" {
+		t.Fatalf("manual strategy diagnostics omitted the full identity: %+v", stats)
+	}
+}
+
 func TestAdaptiveRouteUpdateAndRestart(t *testing.T) {
 	for _, fingerprint := range []uint64{0, 12345} {
 		name := "interface_fallback"
@@ -40,7 +49,12 @@ func TestAdaptiveRouteUpdateAndRestart(t *testing.T) {
 			first := open()
 			destination := M.ParseSocksaddr("example.com:443")
 			learn := func(out *Outbound, mode string) {
-				out.adaptive.observe(destinationKeys(destination, out.networkPartition()), mode, "response", true, time.Millisecond)
+				for _, candidate := range out.adaptive.catalog {
+					if candidate.Mode == mode {
+						out.adaptive.observe(destinationKeys(destination, out.networkPartition()), strategyID(candidate), "response", true, time.Millisecond)
+						break
+					}
+				}
 				if err := out.adaptive.Flush(); err != nil {
 					t.Fatal(err)
 				}

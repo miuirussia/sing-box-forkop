@@ -13,6 +13,15 @@ ClientHello or HTTP request before the real flight; `hostfakesplit` also selects
 host-related splitting. OOB modes put the urgent flag/pointer on the fake raw
 segment. `tlsrec_first` rebuilds record layout before resolving split positions.
 
+`tlsrec_pos` decouples record cuts from TCP `split_pos`. `segment_order` selects
+forward/reverse, hostname-last, or an explicit one-based permutation on the raw
+path. `fake_placement` interleaves fake bursts, with independently cancellable
+`fake_delay`. TLS fake randomization, exact padding and compact templates affect
+only fake ClientHellos. `http_mod` changes only the first HTTP Host header while
+retaining body/pipeline bytes. `hostfake_mode=replace` sends a length-preserving
+hostname decoy at real sequence offsets with an unconditionally invalid checksum;
+ordinary fakes retain their separate sequence-range invariant.
+
 The engine assembles the first ClientHello or HTTP headers across writes, with a
 256 KiB buffer and a 250 ms assembly timer. On incomplete timeout or buffer limit
 it flushes the original bytes unchanged. Semantic hostname cuts and generated
@@ -87,11 +96,24 @@ original IPv4 TTL safely. Linux supports destination changes on dual-stack socke
 v1/v2/draft29 is decrypted with public Initial keys, padded, re-encrypted and
 header-protected; other coalesced packets remain unchanged. Later Initial packets
 retain the original key across a peer CID change; Retry/new-key Initial packets
-reset the key state after authentication. Handshake/0-RTT/1-RTT packets are never
+update the protection key after authentication. Handshake/0-RTT/1-RTT packets are never
 resized without their traffic secrets. Generated QUIC fakes contain only the
 first Initial with an invalid tag, never coalesced application data. STUN PADDING
 requires a multiple of four bytes; it follows MESSAGE-INTEGRITY and precedes the
 last FINGERPRINT, which is recomputed. Integrity bytes remain unchanged.
+
+Initial keys and packet-number history are isolated by destination and client
+SCID, including across server DCID changes and Retry. Each UDP socket retains at
+most 1024 connection states until it closes; at capacity, new connections fail
+before fake or real sends while existing connections continue. Failed/partial
+sends do not commit Initial state. Empty client SCIDs support one connection per
+destination, including sequential connections with new keys.
+
+`quic_split_pos` and `quic_order` split/reorder CRYPTO frames within one Initial,
+preserving stream offsets, packet number and handshake bytes. Existing PADDING
+pays for new frame headers; exhausted datagram budgets fail before sending.
+Unresolved semantic markers and unknown frame types pass through unchanged.
+Cross-packet CRYPTO reordering is not performed. See `DESYNC.md` for parameters.
 
 Run Linux tests in a privileged environment with tcpdump:
 

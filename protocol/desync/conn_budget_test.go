@@ -166,7 +166,7 @@ func TestAdaptiveProbeBudgetRatesWaitingHelloTimeoutOnce(t *testing.T) {
 			t.Fatal("timeout not released/rated")
 		}
 		for _, entry := range snapshot.Entries {
-			if score := entry.Strategies["split"]; score.Failure != 1 || score.Success != 0 {
+			if score := entry.Strategies[strategyID(a.catalog[0])]; score.Failure != 1 || score.Success != 0 {
 				t.Fatalf("timeout rated more than once: %+v", score)
 			}
 		}
@@ -256,7 +256,7 @@ func TestAdaptiveProbeBudgetDuringReplacementDial(t *testing.T) {
 			t.Fatal("replacement dial retained expired permit")
 		}
 		for _, entry := range a.Stats().Entries {
-			if len(entry.Strategies) != 1 || entry.Strategies["split"].Failure != 1 {
+			if len(entry.Strategies) != 1 || entry.Strategies[strategyID(a.catalog[0])].Failure != 1 {
 				t.Fatalf("post-budget replacement error poisoned learning: %+v", entry.Strategies)
 			}
 		}

@@ -8,6 +8,8 @@ import (
 	"io"
 	"net"
 	"os"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -60,12 +62,12 @@ func NewConn(ctx context.Context, conn net.Conn, o option.DesyncOptions) (net.Co
 			return nil, err
 		}
 	}
-	if o.Mode == "" || o.Mode == "none" {
+	if (o.Mode == "" || o.Mode == "none") && o.HTTPMod == "" {
 		return conn, nil
 	}
 	o.FakeSNIPool = append([]string(nil), o.FakeSNIPool...)
 	c := &Conn{Conn: conn, ctx: ctx, opts: o, closed: make(chan struct{}), changed: make(chan struct{})}
-	if rawMode(o.Mode) || o.IPFrag != 0 || o.SeqOvl != 0 || o.WSize != 0 {
+	if rawMode(o.Mode) || o.SegmentOrder != "" || o.IPFrag != 0 || o.SeqOvl != 0 || o.WSize != 0 {
 		s, err := tlsspoof.NewDesyncSession(conn)
 		if err != nil {
 			return nil, err
@@ -194,16 +196,34 @@ func (c *Conn) flush(transform bool) (err error) {
 		return writeAll(c.Conn, b)
 	}
 	o := c.opts
-	isTLS := initialTLSRecord(b)
-	// Semantic positions and generated fakes apply only to flights with a
-	// hostname. Binary proxy handshakes, Host-less HTTP and SNI-less TLS keep
-	// their original bytes. Explicit numeric cuts still apply to binary data.
-	_, hostErr := positions(b, "host")
-	for _, position := range strings.Split(o.SplitPos, ",") {
-		position = strings.TrimSpace(position)
-		if position != "" && position[0] >= 'a' && position[0] <= 'z' && hostErr != nil {
-			return writeAll(c.Conn, b)
+	if o.HTTPMod != "" {
+		b, err = transformHTTP(b, o.HTTPMod)
+		if err != nil {
+			return err
 		}
+	}
+	if o.Mode == "" || o.Mode == "none" {
+		return writeAll(c.Conn, b)
+	}
+	isTLS := initialTLSRecord(b)
+	hp, hostErr := flightHostname(b)
+	// Host-relative strategies pass unrelated protocols through unchanged.
+	specs := []string{o.SplitPos}
+	if isTLS && o.Mode == "tlsrec" && o.TLSRecPos != "" {
+		specs = []string{o.TLSRecPos}
+	} else if isTLS && o.TLSRecFirst {
+		specs = append(specs, o.TLSRecPos)
+	}
+	for _, spec := range specs {
+		for _, position := range strings.Split(spec, ",") {
+			position = strings.TrimSpace(position)
+			if position != "" && position[0] >= 'a' && position[0] <= 'z' && hostErr != nil {
+				return writeAll(c.Conn, b)
+			}
+		}
+	}
+	if hostErr != nil && (o.SegmentOrder == "sni_last" || o.HostFakeMode == "replace") {
+		return writeAll(c.Conn, b)
 	}
 	if o.Mode == "tlsrec" && !isTLS {
 		if c.raw == nil {
@@ -215,78 +235,120 @@ func (c *Conn) flush(transform bool) (err error) {
 	if spec == "" && (o.Mode == "tlsrec" || o.TLSRecFirst) && isTLS {
 		spec = "midsld"
 	}
-	cuts, err := positions(b, spec)
-	if err != nil {
-		if (o.Mode == "fake" || o.Mode == "oob") && o.IPFrag == 0 && o.SeqOvl == 0 && o.WSize == 0 && !o.TLSRecFirst {
-			cuts = nil
-		} else {
-			return err
-		}
-	}
 	if isTLS && (o.Mode == "tlsrec" || o.TLSRecFirst) {
-		b, err = recordSplit(b, cuts)
+		recordSpec := o.TLSRecPos
+		if recordSpec == "" {
+			recordSpec = spec
+		}
+		recordCuts, e := positions(b, recordSpec)
+		if e != nil {
+			return e
+		}
+		b, err = recordSplit(b, recordCuts)
 		if err != nil {
 			return err
 		}
-
-		if o.Mode == "tlsrec" {
-			cuts = nil
-			for p := 0; p+5 <= len(b) && b[p] == 22; {
-				p += 5 + int(b[p+3])<<8 + int(b[p+4])
-				if p < len(b) {
-					cuts = append(cuts, p)
-				}
+		hp, hostErr = flightHostname(b)
+	}
+	var cuts []int
+	if o.Mode == "tlsrec" {
+		for p := 0; p+5 <= len(b) && b[p] == 22; {
+			p += 5 + int(b[p+3])<<8 + int(b[p+4])
+			if p < len(b) {
+				cuts = append(cuts, p)
 			}
-		} else {
-			cuts, err = positions(b, spec)
-			if err != nil {
+		}
+	} else {
+		cuts, err = positions(b, spec)
+		if err != nil {
+			if (o.Mode == "fake" || o.Mode == "oob") && o.IPFrag == 0 && o.SeqOvl == 0 && o.WSize == 0 && !o.TLSRecFirst {
+				cuts = nil
+			} else {
 				return err
 			}
 		}
-
 	}
+	replaceHost := o.Mode == "hostfakesplit" && o.HostFakeMode == "replace"
+	if replaceHost {
+		if hp.start > 0 {
+			cuts = append(cuts, hp.start)
+		}
+		if hp.end < len(b) {
+			cuts = append(cuts, hp.end)
+		}
+		sort.Ints(cuts)
+		cuts = slices.Compact(cuts)
+	}
+	bounds := append(append([]int{0}, cuts...), len(b))
+	orderSpec := o.SegmentOrder
+	if orderSpec == "" && (strings.Contains(o.Mode, "disorder") || o.Mode == "disoob") {
+		orderSpec = "reverse"
+	}
+	hostStart, hostEnd := -1, -1
+	if hostErr == nil {
+		hostStart, hostEnd = hp.start, hp.end
+	}
+	order, err := segmentOrder(orderSpec, bounds, hostStart, hostEnd)
+	if err != nil {
+		return err
+	}
+	interleaved := o.FakePlacement == "between" || o.FakePlacement == "before_between"
+	if interleaved && len(order) < 2 {
+		return fmt.Errorf("desync: interleaved fake placement needs at least two segments")
+	}
+	var fake []byte
 	if fakeMode(o.Mode) && (o.FakePayload != "" || hostErr == nil) {
-		custom, _ := base64.StdEncoding.DecodeString(o.FakePayload)
 		sni := o.FakeSNI
 		if len(o.FakeSNIPool) > 0 {
 			sni = o.FakeSNIPool[(poolCounter.Add(1)-1)%uint64(len(o.FakeSNIPool))]
 		}
-		fake, err := fakePayload(b, sni, o.FakeHost, custom)
+		if replaceHost {
+			name := sni
+			if !isTLS {
+				name = o.FakeHost
+			}
+			fake, err = hostDecoy(b, name)
+		} else {
+			custom, _ := base64.StdEncoding.DecodeString(o.FakePayload)
+			fake, err = fakePayload(b, sni, o.FakeHost, custom)
+			if err == nil && isTLS {
+				fake, err = transformFakeTLS(fake, o.FakeTLSRandom, o.FakeTLSSize, o.FakeTLSTemplate)
+			}
+		}
 		if err != nil {
 			return err
 		}
-		repeats := o.Repeats
-		if repeats == 0 {
-			repeats = 1
+	}
+	fakeDelay := time.Duration(o.FakeDelay)
+	if fakeDelay == 0 && !o.IsExplicit("fake_delay") {
+		fakeDelay = time.Duration(o.Delay)
+	}
+	sendFake := func() error {
+		for i := 0; i < max(1, o.Repeats) && len(fake) > 0; i++ {
+			if e := c.check(); e != nil {
+				return e
+			}
+			packet := tlsspoof.DesyncPacket{Payload: fake, Fake: !replaceHost, Decoy: replaceHost, Fooling: o.Fooling, TTL: o.TTL, Fragment: o.IPFrag, Window: o.WSize, Urgent: o.Mode == "oob" || o.Mode == "disoob"}
+			if e := c.raw.Send(packet); e != nil {
+				return e
+			}
+			if e := c.pause(fakeDelay); e != nil {
+				return e
+			}
 		}
-		for i := 0; i < repeats; i++ {
-			if err = c.check(); err != nil {
-				return err
-			}
-			if err = c.raw.Send(tlsspoof.DesyncPacket{Payload: fake, Fake: true, Fooling: o.Fooling, TTL: o.TTL, Fragment: o.IPFrag, Window: o.WSize, Urgent: o.Mode == "oob" || o.Mode == "disoob"}); err != nil {
-				return err
-			}
-			if err = c.pause(time.Duration(o.Delay)); err != nil {
-				return err
-			}
+		return nil
+	}
+	if o.FakePlacement != "between" {
+		if err = sendFake(); err != nil {
+			return err
 		}
 	}
 	if c.raw != nil {
-		disorder := strings.Contains(o.Mode, "disorder") || o.Mode == "disoob"
-		bounds := append(append([]int{0}, cuts...), len(b))
-		order := make([]int, len(bounds)-1)
-		for i := range order {
-			order[i] = i
-		}
-		if disorder {
-			for i, j := 0, len(order)-1; i < j; i, j = i+1, j-1 {
-				order[i], order[j] = order[j], order[i]
-			}
-		}
-		// fake-only modes need no real raw segments unless a wire knob requires it.
-		sendReal := disorder || o.IPFrag != 0 || o.SeqOvl != 0 || o.WSize != 0
+		// The kernel is queued only the original stream after raw transmission;
+		// it retains ACK/retransmit ownership for reordered and repeated bytes.
+		sendReal := orderSpec != "" || interleaved || replaceHost || o.IPFrag != 0 || o.SeqOvl != 0 || o.WSize != 0
 		if sendReal {
-			for _, idx := range order {
+			for step, idx := range order {
 				start, end := bounds[idx], bounds[idx+1]
 				if o.SeqOvl > 0 && start > 0 {
 					start = max(0, start-o.SeqOvl)
@@ -306,6 +368,11 @@ func (c *Conn) flush(transform bool) (err error) {
 				}
 				if err = c.pause(time.Duration(o.Delay)); err != nil {
 					return err
+				}
+				if interleaved && step+1 < len(order) {
+					if err = sendFake(); err != nil {
+						return err
+					}
 				}
 			}
 		}

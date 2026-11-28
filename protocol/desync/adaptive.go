@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	engine "github.com/sagernet/sing-box/common/desync"
 	"github.com/sagernet/sing-box/option"
 	M "github.com/sagernet/sing/common/metadata"
 	"golang.org/x/net/publicsuffix"
@@ -67,31 +66,9 @@ type Adaptive struct {
 func NewAdaptive(tag string, o option.DesyncOptions) *Adaptive {
 	data, _ := json.Marshal(o)
 	sum := sha256.Sum256(append([]byte(tag+"\x00"), data...))
-	a := &Adaptive{options: o, partition: hex.EncodeToString(sum[:16]), entries: map[string]*Entry{}, active: map[string]int{}}
-	// Each candidate preserves dialer and explicit fake/UDP settings. The engine
-	// filters incompatible or unavailable mechanisms before they enter the catalog.
-	for _, mode := range []string{o.Mode, "split", "tlsrec", "multi_split", "disorder", "fake_split"} {
-		duplicate := false
-		for _, s := range a.catalog {
-			if s.Mode == mode {
-				duplicate = true
-			}
-		}
-		if duplicate {
-			continue
-		}
-		candidate := o
-		candidate.Mode = mode
-		if mode == "multi_split" {
-			candidate.SplitPos = "1,midsld"
-		}
-		normalized, err := option.NormalizeDesyncOptions(candidate)
-		if err == nil && engine.Validate(normalized) == nil {
-			a.catalog = append(a.catalog, normalized)
-		}
-	}
-	if len(a.catalog) == 0 {
-		a.catalog = []option.DesyncOptions{o}
+	a := &Adaptive{
+		options: cloneDesyncOptions(o), partition: hex.EncodeToString(sum[:16]),
+		entries: map[string]*Entry{}, active: map[string]int{}, catalog: adaptiveCatalog(o),
 	}
 	return a
 }
@@ -117,8 +94,22 @@ func (a *Adaptive) Load() error {
 	defer a.mu.Unlock()
 	a.routeGeneration += s.RouteGeneration
 	now := time.Now()
+	known := make(map[string]bool, len(a.catalog))
+	for _, candidate := range a.catalog {
+		known[strategyID(candidate)] = true
+	}
 	for key, e := range s.Entries {
-		if e == nil || e.Strategies == nil || len(e.Strategies) > 32 || e.Updated.After(now) || now.Sub(e.Updated) > time.Duration(a.options.Adaptive.TTL) {
+		if e == nil || e.Strategies == nil || len(e.Strategies) > maxAdaptiveStrategies || e.Updated.After(now) || now.Sub(e.Updated) > time.Duration(a.options.Adaptive.TTL) {
+			continue
+		}
+		// Version 1 snapshots may contain mode-only keys. They cannot be
+		// attributed to a full configuration, so retain only exact known IDs.
+		for id := range e.Strategies {
+			if !known[id] {
+				delete(e.Strategies, id)
+			}
+		}
+		if len(e.Strategies) == 0 {
 			continue
 		}
 		a.entries[key] = e
@@ -253,14 +244,13 @@ func (a *Adaptive) ranked(keys []string) []option.DesyncOptions {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.pruneLocked(time.Now())
-	candidates := append([]option.DesyncOptions(nil), a.catalog...)
-	weight := func(mode string) float64 {
+	weight := func(id string) float64 {
 		for i, key := range keys {
 			e := a.entries[key]
 			if e == nil {
 				continue
 			}
-			s, ok := e.Strategies[mode]
+			s, ok := e.Strategies[id]
 			if !ok {
 				continue
 			}
@@ -272,10 +262,22 @@ func (a *Adaptive) ranked(keys []string) []option.DesyncOptions {
 		}
 		return .5
 	}
-	sort.SliceStable(candidates, func(i, j int) bool { return weight(candidates[i].Mode) > weight(candidates[j].Mode) })
+	type weightedStrategy struct {
+		options option.DesyncOptions
+		weight  float64
+	}
+	weighted := make([]weightedStrategy, len(a.catalog))
+	for i, candidate := range a.catalog {
+		weighted[i] = weightedStrategy{options: candidate, weight: weight(strategyID(candidate))}
+	}
+	sort.SliceStable(weighted, func(i, j int) bool { return weighted[i].weight > weighted[j].weight })
+	candidates := make([]option.DesyncOptions, len(weighted))
+	for i, candidate := range weighted {
+		candidates[i] = cloneDesyncOptions(candidate.options)
+	}
 	return candidates
 }
-func (a *Adaptive) observe(keys []string, mode, reason string, success bool, latency time.Duration) {
+func (a *Adaptive) observe(keys []string, id, reason string, success bool, latency time.Duration) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.closed {
@@ -288,7 +290,7 @@ func (a *Adaptive) observe(keys []string, mode, reason string, success bool, lat
 			e = &Entry{Strategies: map[string]Score{}}
 			a.entries[key] = e
 		}
-		s := e.Strategies[mode]
+		s := e.Strategies[id]
 		if success {
 			s.Success++
 		} else {
@@ -303,7 +305,7 @@ func (a *Adaptive) observe(keys []string, mode, reason string, success bool, lat
 			}
 		}
 		s.LastReason = reason
-		e.Strategies[mode] = s
+		e.Strategies[id] = s
 		e.Updated = now
 		if len(e.Hosts) < 8 {
 			seen := false
@@ -317,10 +319,10 @@ func (a *Adaptive) observe(keys []string, mode, reason string, success bool, lat
 			}
 		}
 	}
-	if a.current != "" && a.current != mode {
-		a.lastSwitch = a.current + " -> " + mode + ": " + reason
+	if a.current != "" && a.current != id {
+		a.lastSwitch = a.current + " -> " + id + ": " + reason
 	}
-	a.current = mode
+	a.current = id
 	a.reason = reason
 	a.pruneLocked(now)
 	a.scheduleFlushLocked()
@@ -387,7 +389,7 @@ func (a *Adaptive) dialContext(ctx context.Context, d, identity M.Socksaddr, gen
 		if err == nil {
 			break
 		}
-		a.observe(keys, candidates[index].Mode, "connect: "+err.Error(), false, time.Since(start))
+		a.observe(keys, strategyID(candidates[index]), "connect: "+err.Error(), false, time.Since(start))
 		if ctx.Err() != nil {
 			break
 		}

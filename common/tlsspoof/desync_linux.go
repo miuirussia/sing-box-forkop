@@ -105,6 +105,12 @@ func (d *DesyncSession) sendLocked(p DesyncPacket) error {
 		return nil
 	}
 	info := spoofPacketInfo{seqNum: s.sendNext + uint32(p.Offset), ackNum: s.receiveNext}
+	if p.Decoy {
+		if p.Fake || p.Offset < 0 {
+			return fmt.Errorf("desync: invalid host decoy sequence range")
+		}
+		info.corrupt = true
+	}
 	if d.timestamps {
 		info.options = make([]byte, 12)
 		header.EncodeTSOption(s.timestamp, 0, info.options)

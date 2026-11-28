@@ -10,12 +10,15 @@ type DesyncPacket struct {
 	Payload    []byte
 	Offset     int
 	Fake       bool
-	Fooling    string
-	TTL        int
-	Window     int
-	Fragment   int
-	Overlap    int
-	Urgent     bool
+	// Decoy uses real sequence offsets but is ALWAYS checksum-invalid. It is
+	// reserved for length-preserving host substitution, never kernel-queued.
+	Decoy    bool
+	Fooling  string
+	TTL      int
+	Window   int
+	Fragment int
+	Overlap  int
+	Urgent   bool
 }
 
 // NewDesyncSession requires an established socket which has not carried data.

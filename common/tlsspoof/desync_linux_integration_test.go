@@ -74,3 +74,60 @@ func TestDesyncRawRealDeliveredBeforeKernelWrite(t *testing.T) {
 		listener.Close()
 	}
 }
+
+func TestDesyncHostDecoyAlwaysRejectedAtRealSequence(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("CAP_NET_RAW/CAP_NET_ADMIN required")
+	}
+	for _, network := range []string{"tcp4", "tcp6"} {
+		t.Run(network, func(t *testing.T) {
+			host := "127.0.0.1:0"
+			if network == "tcp6" {
+				host = "[::1]:0"
+			}
+			listener, err := net.Listen(network, host)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			raw, err := net.Dial(network, listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer raw.Close()
+			peer, err := listener.Accept()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer peer.Close()
+			session, err := NewDesyncSession(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer session.Close()
+			decoy := []byte("DECOY-MUST-NOT-BE-ACCEPTED")
+			if err = session.Send(DesyncPacket{Payload: decoy, Decoy: true, TTL: 64, Fooling: "none"}); err != nil {
+				t.Fatal(err)
+			}
+			if err = peer.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+				t.Fatal(err)
+			}
+			b := make([]byte, len(decoy))
+			n, err := peer.Read(b)
+			if timeout, ok := err.(net.Error); n != 0 || !ok || !timeout.Timeout() {
+				t.Fatalf("server consumed decoy: %q, %v", b[:n], err)
+			}
+			if err = peer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			real := []byte("ORIGINAL-SERVER-STREAM")
+			if _, err = raw.Write(real); err != nil {
+				t.Fatal(err)
+			}
+			got := make([]byte, len(real))
+			if _, err = io.ReadFull(peer, got); err != nil || !bytes.Equal(got, real) {
+				t.Fatalf("server stream changed: %q, %v", got, err)
+			}
+		})
+	}
+}

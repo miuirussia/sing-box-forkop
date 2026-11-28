@@ -383,8 +383,10 @@ class Stand:
                         raise RuntimeError("capture does not show configured IP fragmentation")
                     tcp = [p for p in observed if p["protocol"] == "tcp" and p["port"] == (18443 if protocol == "tls" else 18080) and p["payload"]]
                     mode = options["mode"]
-                    if "fake" in mode and not any(b"fake.example.org" in p["payload"] for p in tcp):
+                    if "fake" in mode and options.get("hostfake_mode") != "replace" and not any(b"fake.example.org" in p["payload"] for p in tcp):
                         raise RuntimeError("fake hostname is missing from the packet capture")
+                    if options.get("hostfake_mode") == "replace" and not any(not p["checksum_valid"] for p in tcp):
+                        raise RuntimeError("host replacement decoy must have invalid checksum")
                     if options.get("autottl"):
                         fake = [p for p in tcp if b"fake.example.org" in p["payload"]]
                         if not fake or any(p["ttl"] != 1 for p in fake):
@@ -471,6 +473,15 @@ def main():
                 stand.check(f"fooling-{fooling}", {"mode": "fake_split", "fake_sni": "fake.example.org", "fake_host": "fake.example.org", "fooling": fooling}, "tls")
             stand.check("ip-fragments", {"mode": "split", "ipfrag": 200}, "tls")
             stand.check("sequence-overlap", {"mode": "fake_split", "fake_sni": "fake.example.org", "fake_host": "fake.example.org", "seqovl": 8}, "tls")
+            for name, options in (
+                ("independent-record-cuts", {"mode": "multi_split", "tlsrec_first": True, "tlsrec_pos": "midsld", "split_pos": "host+1,endhost-1"}),
+                ("segment-permutation", {"mode": "multi_split", "split_pos": "host+1,endhost-1", "segment_order": "2,1,3"}),
+                ("host-segment-last", {"mode": "split", "split_pos": "host,endhost", "segment_order": "sni_last"}),
+                ("interleaved-dynamic-fake", {"mode": "fake_split", "split_pos": "host+1,endhost-1", "fake_placement": "before_between", "fake_delay": "1ms", "fake_tls_random": True, "fake_tls_size": 4096, "fake_tls_template": "compact", "fake_sni": "fake.example.org", "fake_host": "fake.example.org"}),
+                ("host-replacement", {"mode": "hostfakesplit", "hostfake_mode": "replace", "tlsrec_first": True, "tlsrec_pos": "midsld", "split_pos": "midsld", "fake_sni": "fake.example.org", "fake_host": "fake.example.org", "fooling": "none", "ttl": 64}),
+            ):
+                for protocol in ("tls", "http"):
+                    stand.check(f"{name}-{protocol}", options, protocol)
             if args.ipv6:
                 for fooling in ("hopbyhop", "destopt"):
                     stand.check(f"ipv6-{fooling}", {"mode": "fake_split", "fake_sni": "fake.example.org", "fake_host": "fake.example.org", "fooling": fooling}, "tls")

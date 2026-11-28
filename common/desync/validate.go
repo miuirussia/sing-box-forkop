@@ -29,6 +29,9 @@ func fakeMode(mode string) bool {
 // Validate rejects settings which cannot have their specified wire effect.
 // Call option.NormalizeDesyncOptions before this function.
 func Validate(o option.DesyncOptions) error {
+	if err := option.ValidateDesyncExtensions(o); err != nil {
+		return err
+	}
 	switch o.Mode {
 	case "", "none", "split", "disorder", "tlsrec", "fake", "fake_split", "oob", "multi_split", "fake_disorder", "multi_disorder", "disoob", "hostfakesplit":
 	default:
@@ -66,7 +69,7 @@ func Validate(o option.DesyncOptions) error {
 	if o.Delay < 0 || int64(o.Delay) > int64(10e9) {
 		return fmt.Errorf("desync: delay must be between 0 and 10s")
 	}
-	if (rawMode(o.Mode) || o.IPFrag != 0 || o.SeqOvl != 0 || o.WSize != 0 || o.AutoTTL) && runtime.GOOS != "linux" {
+	if (rawMode(o.Mode) || o.SegmentOrder != "" || o.IPFrag != 0 || o.SeqOvl != 0 || o.WSize != 0 || o.AutoTTL) && runtime.GOOS != "linux" {
 		return fmt.Errorf("desync: mode %s and raw TCP options require Linux with CAP_NET_RAW and CAP_NET_ADMIN", o.Mode)
 	}
 	if o.Mode == "" || o.Mode == "none" {

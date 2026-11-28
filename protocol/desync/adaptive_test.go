@@ -157,7 +157,7 @@ func TestAdaptiveBoundsAndPartition(t *testing.T) {
 		a.release("host")
 	}
 	for i := 0; i < 1100; i++ {
-		a.observe([]string{string(rune(i))}, "split", "failure", false, 0)
+		a.observe([]string{string(rune(i))}, strategyID(a.catalog[0]), "failure", false, 0)
 	}
 	if len(a.Stats().Entries) > a.options.Adaptive.MaxEntries {
 		t.Fatal("entry limit exceeded")
@@ -208,7 +208,7 @@ func TestAdaptivePersistence(t *testing.T) {
 	a.store = store
 	keys := destinationKeys(M.ParseSocksaddr("example.com:443"), 0)
 	for range 10 {
-		a.observe(keys, "tlsrec", "response", true, time.Millisecond)
+		a.observe(keys, strategyID(a.catalog[1]), "response", true, time.Millisecond)
 	}
 	if store.writes != 0 {
 		t.Fatal("wrote every event")

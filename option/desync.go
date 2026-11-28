@@ -20,38 +20,49 @@ import (
 // retained so explicit false and zero values override a preset.
 type DesyncOptions struct {
 	DialerOptions
-	Preset         string                 `json:"preset,omitempty"`
-	Mode           string                 `json:"mode,omitempty"`
-	SplitPos       string                 `json:"split_pos,omitempty"`
-	FakeSNI        string                 `json:"fake_sni,omitempty"`
-	FakeHost       string                 `json:"fake_host,omitempty"`
-	FakePayload    string                 `json:"fake_payload,omitempty"`
-	FakeSNIPool    []string               `json:"fake_sni_pool,omitempty"`
-	Repeats        int                    `json:"repeats,omitempty"`
-	Delay          badoption.Duration     `json:"delay,omitempty"`
-	TTL            int                    `json:"ttl,omitempty"`
-	Fooling        string                 `json:"fooling,omitempty"`
-	TLSRecFirst    bool                   `json:"tlsrec_first,omitempty"`
-	SeqOvl         int                    `json:"seqovl,omitempty"`
-	AutoTTL        bool                   `json:"autottl,omitempty"`
-	IPFrag         int                    `json:"ipfrag,omitempty"`
-	SynData        string                 `json:"syndata,omitempty"`
-	WSize          int                    `json:"wsize,omitempty"`
-	WScale         int                    `json:"wscale,omitempty"`
-	UDPMode        string                 `json:"udp_mode,omitempty"`
-	UDPFakePayload string                 `json:"udp_fake_payload,omitempty"`
-	UDPTTL         int                    `json:"udp_ttl,omitempty"`
-	UDPRepeats     int                    `json:"udp_repeats,omitempty"`
-	UDPOutRange    string                 `json:"udp_out_range,omitempty"`
-	UDPKeepSocket  bool                   `json:"udp_keep_socket,omitempty"`
-	UDPLen         int                    `json:"udplen,omitempty"`
-	QUICDesync     *bool                  `json:"quic_desync,omitempty"`
-	QUICRepeats    int                    `json:"quic_repeats,omitempty"`
-	AutoTune       *bool                  `json:"auto_tune,omitempty"`
-	Adaptive       *DesyncAdaptiveOptions `json:"adaptive,omitempty"`
-	Strategy       string                 `json:"strategy,omitempty"`
-	WScaleExplicit bool                   `json:"-"`
-	present        map[string]json.RawMessage
+	Preset          string                 `json:"preset,omitempty"`
+	Mode            string                 `json:"mode,omitempty"`
+	SplitPos        string                 `json:"split_pos,omitempty"`
+	TLSRecPos       string                 `json:"tlsrec_pos,omitempty"`
+	SegmentOrder    string                 `json:"segment_order,omitempty"`
+	FakePlacement   string                 `json:"fake_placement,omitempty"`
+	FakeDelay       badoption.Duration     `json:"fake_delay,omitempty"`
+	FakeTLSRandom   bool                   `json:"fake_tls_random,omitempty"`
+	FakeTLSSize     int                    `json:"fake_tls_size,omitempty"`
+	FakeTLSTemplate string                 `json:"fake_tls_template,omitempty"`
+	HTTPMod         string                 `json:"http_mod,omitempty"`
+	HostFakeMode    string                 `json:"hostfake_mode,omitempty"`
+	FakeSNI         string                 `json:"fake_sni,omitempty"`
+	FakeHost        string                 `json:"fake_host,omitempty"`
+	FakePayload     string                 `json:"fake_payload,omitempty"`
+	FakeSNIPool     []string               `json:"fake_sni_pool,omitempty"`
+	Repeats         int                    `json:"repeats,omitempty"`
+	Delay           badoption.Duration     `json:"delay,omitempty"`
+	TTL             int                    `json:"ttl,omitempty"`
+	Fooling         string                 `json:"fooling,omitempty"`
+	TLSRecFirst     bool                   `json:"tlsrec_first,omitempty"`
+	SeqOvl          int                    `json:"seqovl,omitempty"`
+	AutoTTL         bool                   `json:"autottl,omitempty"`
+	IPFrag          int                    `json:"ipfrag,omitempty"`
+	SynData         string                 `json:"syndata,omitempty"`
+	WSize           int                    `json:"wsize,omitempty"`
+	WScale          int                    `json:"wscale,omitempty"`
+	UDPMode         string                 `json:"udp_mode,omitempty"`
+	UDPFakePayload  string                 `json:"udp_fake_payload,omitempty"`
+	UDPTTL          int                    `json:"udp_ttl,omitempty"`
+	UDPRepeats      int                    `json:"udp_repeats,omitempty"`
+	UDPOutRange     string                 `json:"udp_out_range,omitempty"`
+	UDPKeepSocket   bool                   `json:"udp_keep_socket,omitempty"`
+	UDPLen          int                    `json:"udplen,omitempty"`
+	QUICDesync      *bool                  `json:"quic_desync,omitempty"`
+	QUICRepeats     int                    `json:"quic_repeats,omitempty"`
+	QUICSplitPos    string                 `json:"quic_split_pos,omitempty"`
+	QUICOrder       string                 `json:"quic_order,omitempty"`
+	AutoTune        *bool                  `json:"auto_tune,omitempty"`
+	Adaptive        *DesyncAdaptiveOptions `json:"adaptive,omitempty"`
+	Strategy        string                 `json:"strategy,omitempty"`
+	WScaleExplicit  bool                   `json:"-"`
+	present         map[string]json.RawMessage
 }
 
 type DesyncAdaptiveOptions struct {
@@ -129,6 +140,12 @@ func (o DesyncOptions) MarshalJSON() ([]byte, error) {
 			if err != nil {
 				return nil, err
 			}
+		}
+	}
+	if o.WScaleExplicit {
+		values["wscale"], err = json.Marshal(o.WScale)
+		if err != nil {
+			return nil, err
 		}
 	}
 	return json.Marshal(values)
@@ -216,6 +233,11 @@ func NormalizeDesyncOptions(o DesyncOptions) (DesyncOptions, error) {
 		}
 	}
 	if fake {
+		if base.FakeDelay == 0 {
+			if _, explicit := presence["fake_delay"]; !explicit {
+				base.FakeDelay = base.Delay
+			}
+		}
 		if base.Repeats == 0 {
 			if _, explicit := presence["repeats"]; !explicit {
 				base.Repeats = 1
@@ -366,6 +388,9 @@ func NormalizeDesyncOptions(o DesyncOptions) (DesyncOptions, error) {
 		}
 		base.Adaptive = &a
 	}
+	if err := ValidateDesyncExtensions(base); err != nil {
+		return base, err
+	}
 	return base, nil
 }
 
@@ -400,7 +425,7 @@ func ParseDesyncStrategy(s string) (DesyncOptions, error) {
 		if _, ok := values[key]; ok {
 			return DesyncOptions{}, fmt.Errorf("duplicate strategy key %q", key)
 		}
-		if !desyncContains([]string{"preset", "mode", "split_pos", "fake_sni", "fake_host", "fake_payload", "fake_sni_pool", "repeats", "delay", "ttl", "fooling", "tlsrec_first", "seqovl", "autottl", "ipfrag", "syndata", "wsize", "wscale", "udp_mode", "udp_fake_payload", "udp_ttl", "udp_repeats", "udp_out_range", "udp_keep_socket", "udplen", "quic_desync", "quic_repeats", "auto_tune", "adaptive"}, key) {
+		if !desyncContains([]string{"preset", "mode", "split_pos", "tlsrec_pos", "segment_order", "fake_placement", "fake_delay", "fake_tls_random", "fake_tls_size", "fake_tls_template", "http_mod", "hostfake_mode", "quic_split_pos", "quic_order", "fake_sni", "fake_host", "fake_payload", "fake_sni_pool", "repeats", "delay", "ttl", "fooling", "tlsrec_first", "seqovl", "autottl", "ipfrag", "syndata", "wsize", "wscale", "udp_mode", "udp_fake_payload", "udp_ttl", "udp_repeats", "udp_out_range", "udp_keep_socket", "udplen", "quic_desync", "quic_repeats", "auto_tune", "adaptive"}, key) {
 			return DesyncOptions{}, fmt.Errorf("%s is not a strategy token", key)
 		}
 		if key == "adaptive" || (key == "fake_sni_pool" && strings.HasPrefix(s, "[")) {
@@ -436,12 +461,12 @@ func ParseDesyncStrategy(s string) (DesyncOptions, error) {
 			s = s[end:]
 		}
 		switch key {
-		case "repeats", "ttl", "seqovl", "ipfrag", "wsize", "wscale", "udp_ttl", "udp_repeats", "udplen", "quic_repeats":
+		case "repeats", "ttl", "seqovl", "ipfrag", "wsize", "wscale", "udp_ttl", "udp_repeats", "udplen", "quic_repeats", "fake_tls_size":
 			if _, err := strconv.Atoi(token); err != nil {
 				return DesyncOptions{}, fmt.Errorf("%s must be an integer", key)
 			}
 			values[key] = json.RawMessage(token)
-		case "tlsrec_first", "autottl", "udp_keep_socket", "auto_tune", "quic_desync":
+		case "tlsrec_first", "autottl", "udp_keep_socket", "auto_tune", "quic_desync", "fake_tls_random":
 			if token != "true" && token != "false" {
 				return DesyncOptions{}, fmt.Errorf("%s must be true or false", key)
 			}

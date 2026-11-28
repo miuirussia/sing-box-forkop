@@ -259,6 +259,93 @@ func TestLinuxPacketDisorderOverlapAndWindow(t *testing.T) {
 		})
 	}
 }
+
+func TestLinuxPacketSegmentPermutationsAndInterleavedFakes(t *testing.T) {
+	for _, host := range []string{"127.0.0.1", "::1"} {
+		for _, placement := range []string{"between", "before_between"} {
+			t.Run(host+"/"+placement, func(t *testing.T) {
+				fake := []byte("INTERLEAVED-FAKE")
+				o := option.DesyncOptions{Mode: "fake_split", SplitPos: "host+1,endhost-1", SegmentOrder: "2,1,3", FakePlacement: placement, FakePayload: base64.StdEncoding.EncodeToString(fake), TTL: 64, Repeats: 1, WSize: 4321}
+				packets, real, port := runCapturedHTTP(t, host, o)
+				cuts, err := positions(real, o.SplitPos)
+				if err != nil {
+					t.Fatal(err)
+				}
+				bounds := []int{0, cuts[0], cuts[1], len(real)}
+				var burst []capturedPacket
+				for _, p := range packets {
+					if p.dst == port && len(p.payload) > 0 && p.window == 4321 {
+						burst = append(burst, p)
+					}
+				}
+				wantCount := 5
+				if placement == "before_between" {
+					wantCount++
+				}
+				if len(burst) != wantCount {
+					t.Fatalf("raw burst has %d packets, want %d", len(burst), wantCount)
+				}
+				at := 0
+				if placement == "before_between" {
+					if !bytes.Equal(burst[at].payload, fake) {
+						t.Fatal("missing leading fake")
+					}
+					at++
+				}
+				var firstSeq uint32
+				for step, index := range []int{1, 0, 2} {
+					p := burst[at]
+					if !bytes.Equal(p.payload, real[bounds[index]:bounds[index+1]]) {
+						t.Fatalf("wrong segment at step %d: %q", step, p.payload)
+					}
+					if index == 0 {
+						firstSeq = p.seq
+					}
+					at++
+					if step < 2 {
+						if !bytes.Equal(burst[at].payload, fake) {
+							t.Fatal("fake missing between real segments")
+						}
+						at++
+					}
+				}
+				for _, p := range burst {
+					if bytes.Equal(p.payload, fake) && int32(p.seq+uint32(len(fake))-firstSeq) > 0 {
+						t.Fatal("interleaved fake overlaps real sequence range")
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestLinuxPacketHostReplacementDecoy(t *testing.T) {
+	for _, host := range []string{"127.0.0.1", "::1"} {
+		t.Run(host, func(t *testing.T) {
+			o := option.DesyncOptions{Mode: "hostfakesplit", HostFakeMode: "replace", SplitPos: "midsld", FakeHost: "decoy.test", Fooling: "none", TTL: 64, Repeats: 1}
+			packets, real, port := runCapturedHTTP(t, host, o)
+			decoy, err := hostDecoy(real, o.FakeHost)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoySeq, realSeq uint32
+			foundDecoy, foundReal := false, false
+			for _, p := range packets {
+				if p.dst != port {
+					continue
+				}
+				if bytes.Equal(p.payload, decoy) {
+					decoySeq, foundDecoy = p.seq, true
+				} else if len(p.payload) > 0 && bytes.HasPrefix(p.payload, []byte("POST")) {
+					realSeq, foundReal = p.seq, true
+				}
+			}
+			if !foundDecoy || !foundReal || decoySeq != realSeq {
+				t.Fatalf("host decoy missing or wrong sequence: decoy=%d/%v real=%d/%v", decoySeq, foundDecoy, realSeq, foundReal)
+			}
+		})
+	}
+}
 func TestLinuxPacketFakeFoolingNeverServerStream(t *testing.T) {
 	for _, host := range []string{"127.0.0.1", "::1"} {
 		for _, fooling := range []string{"", "badseq", "badack", "badsum", "md5", "md5_badack", "badseq_badack_badsum", "datanoack", "none", "ts", "badtimestamp", "hopbyhop", "destopt", "ipfrag"} {

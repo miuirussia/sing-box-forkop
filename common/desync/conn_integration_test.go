@@ -20,6 +20,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -104,6 +105,55 @@ type chunkingConn struct {
 	chunk int
 }
 
+func TestTLSExtendedStrategyHandshake(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		options option.DesyncOptions
+	}{
+		{"independent records", option.DesyncOptions{Mode: "multi_split", TLSRecFirst: true, TLSRecPos: "midsld", SplitPos: "sniext+1,endhost-1"}},
+		{"permutation", option.DesyncOptions{Mode: "multi_split", SplitPos: "sni+1,endhost-1", SegmentOrder: "2,1,3"}},
+		{"host last", option.DesyncOptions{Mode: "split", SplitPos: "sni,endhost", SegmentOrder: "sni_last"}},
+		{"interleaved dynamic fake", option.DesyncOptions{Mode: "fake_split", SplitPos: "sni+1,endhost-1", FakePlacement: "before_between", FakeDelay: badoption.Duration(time.Millisecond), FakeTLSRandom: true, FakeTLSTemplate: "compact", FakeTLSSize: 4096, TTL: 64}},
+		{"host decoy across records", option.DesyncOptions{Mode: "hostfakesplit", HostFakeMode: "replace", TLSRecFirst: true, TLSRecPos: "midsld", SplitPos: "midsld", FakeSNI: "decoy.test", Fooling: "none", TTL: 64}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if (rawMode(tc.options.Mode) || tc.options.SegmentOrder != "") && (runtime.GOOS != "linux" || os.Geteuid() != 0) {
+				t.Skip("Linux CAP_NET_RAW/CAP_NET_ADMIN required")
+			}
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte("extended TLS intact"))
+			}))
+			defer server.Close()
+			raw, err := net.DialTimeout("tcp", server.Listener.Addr().String(), time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer raw.Close()
+			_ = raw.SetDeadline(time.Now().Add(5 * time.Second))
+			o, err := option.NormalizeDesyncOptions(tc.options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wrapped, err := NewConn(context.Background(), raw, o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer wrapped.Close()
+			client := tls.Client(&chunkingConn{Conn: wrapped, chunk: 13}, &tls.Config{ServerName: "example.com", InsecureSkipVerify: true})
+			if err = client.Handshake(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = io.WriteString(client, "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"); err != nil {
+				t.Fatal(err)
+			}
+			reply, err := io.ReadAll(client)
+			if err != nil || !bytes.Contains(reply, []byte("extended TLS intact")) {
+				t.Fatalf("TLS application stream: %q, %v", reply, err)
+			}
+		})
+	}
+}
+
 func (c *chunkingConn) Write(b []byte) (int, error) {
 	n := 0
 	for len(b) > 0 {
@@ -178,6 +228,42 @@ func TestHTTPRealStreamAllModes(t *testing.T) {
 				t.Fatal("server receive timeout")
 			}
 		})
+	}
+}
+
+func TestHTTPHostTransformRealRequest(t *testing.T) {
+	const body = "body containing Host: untouched.example\r\n"
+	requests := make(chan string, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil || !strings.EqualFold(r.Host, "www.example.com:8080") || string(b) != body {
+			t.Errorf("request semantics changed: Host=%q body=%q err=%v", r.Host, b, err)
+		}
+		requests <- r.Host
+		_, _ = io.WriteString(w, "HTTP body intact")
+	}))
+	defer server.Close()
+	raw, err := net.DialTimeout("tcp", server.Listener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	_ = raw.SetDeadline(time.Now().Add(3 * time.Second))
+	wrapped, err := NewConn(context.Background(), raw, option.DesyncOptions{Mode: "multi_split", SplitPos: "host+1,midsld", HTTPMod: "hcsmix,dcsmix,rmspace"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wrapped.Close()
+	request := fmt.Sprintf("POST / HTTP/1.1\r\nHost: www.example.com:8080\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+	if _, err = io.WriteString(wrapped, request); err != nil {
+		t.Fatal(err)
+	}
+	reply, err := io.ReadAll(wrapped)
+	if err != nil || !bytes.Contains(reply, []byte("HTTP body intact")) {
+		t.Fatalf("HTTP response: %q, %v", reply, err)
+	}
+	if len(requests) != 1 {
+		t.Fatalf("server saw %d requests, want one", len(requests))
 	}
 }
 func stunRequest() []byte {
@@ -271,7 +357,15 @@ func TestUDPRealQUICHandshake(t *testing.T) {
 		name    string
 		dial    bool
 		version quic.Version
-	}{{"packet-v1", false, quic.Version1}, {"dial-v1", true, quic.Version1}, {"packet-v2", false, quic.Version2}, {"dial-v2", true, quic.Version2}} {
+		split   string
+		order   string
+	}{
+		{"packet-v1", false, quic.Version1, "", ""}, {"dial-v1", true, quic.Version1, "", ""},
+		{"packet-v2", false, quic.Version2, "", ""}, {"dial-v2", true, quic.Version2, "", ""},
+		{"crypto-packet-v1", false, quic.Version1, "1,32", "reverse"}, {"crypto-dial-v1", true, quic.Version1, "1,32", "reverse"},
+		{"crypto-packet-v2", false, quic.Version2, "1,32", "reverse"}, {"crypto-dial-v2", true, quic.Version2, "1,32", "reverse"},
+		{"sni-packet-v1", false, quic.Version1, "midsld", "sni_last"}, {"sni-dial-v2", true, quic.Version2, "midsld", "sni_last"},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
 			quicConfig := &quic.Config{Versions: []quic.Version{tc.version}}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -301,6 +395,7 @@ func TestUDPRealQUICHandshake(t *testing.T) {
 				done <- err
 			}()
 			o := option.DesyncOptions{Mode: "none", UDPMode: "quic", UDPLen: 32, UDPRepeats: 2, UDPTTL: 64, UDPOutRange: "1:2", UDPKeepSocket: true}
+			o.QUICSplitPos, o.QUICOrder = tc.split, tc.order
 			clientTLS := &tls.Config{ServerName: "example.com", InsecureSkipVerify: true, NextProtos: []string{"desync-test"}}
 			var client *quic.Conn
 			if tc.dial {

@@ -16,7 +16,7 @@ import (
 // 0-RTT and 1-RTT packets coalesced after it remain byte-for-byte unchanged.
 type initialHeader struct {
 	version                          uint32
-	dcid                             []byte
+	dcid, scid                       []byte
 	lengthAt, lengthBytes, pnAt, end int
 	length                           uint64
 }
@@ -58,6 +58,7 @@ func initialPacket(b []byte) (h initialHeader, err error) {
 	if n > 20 || p+n >= len(b) {
 		return bad()
 	}
+	h.scid = b[p : p+n]
 	p += n
 	token, k, e := readQUICVarint(b, p)
 	if e != nil {
@@ -169,66 +170,40 @@ func unprotectInitial(b []byte, h initialHeader, state initialState) (header, pl
 	}
 	plain, err = aead.Open(nil, nonce, b[h.pnAt+pnLen:h.end], header)
 	if err != nil {
-		return nil, nil, nil, 0, nil, nil, fmt.Errorf("desync: cannot authenticate QUIC Initial for udplen: %w", err)
+		return nil, nil, nil, 0, nil, nil, fmt.Errorf("desync: cannot authenticate QUIC Initial: %w", err)
 	}
 	return header, plain, nonce, pn, hp, aead, nil
 }
 func padQUICInitial(b []byte, extra int, state initialState) ([]byte, initialState, error) {
-	if extra < 0 || len(b)+extra > 65507 {
+	return transformQUICInitial(b, extra, "", "", state)
+}
+
+// transformQUICInitial authenticates once for both CRYPTO rewriting and udplen.
+// It never creates a packet number or touches packets coalesced after Initial.
+func transformQUICInitial(b []byte, extra int, split, order string, state initialState) ([]byte, initialState, error) {
+	if extra < 0 || extra > 65507 || len(b) > 65507-extra {
 		return nil, state, fmt.Errorf("desync: padded QUIC exceeds UDP size")
 	}
 	h, err := initialPacket(b)
 	if err != nil {
 		return nil, state, err
 	}
+	originalState := state
 	header, plain, nonce, pn, hp, aead, err := unprotectInitial(b, h, state)
 	if err != nil && state.seen && state.dcid != string(h.dcid) {
-		state = initialState{}
+		// Retry changes the protection key, not this connection's packet numbers.
+		state.dcid = string(h.dcid)
 		header, plain, nonce, pn, hp, aead, err = unprotectInitial(b, h, state)
-	}
-	if err != nil {
-		return nil, state, err
-	}
-
-	width := h.lengthBytes
-	for h.length+uint64(extra) >= (uint64(1) << uint(width*8-2)) {
-		width *= 2
-		if width > 8 {
-			return nil, state, fmt.Errorf("desync: QUIC length overflow")
+		if err != nil && len(h.scid) == 0 {
+			// Zero-SCID sockets support one connection at a time; a fresh
+			// connection can reuse the same destination with a new number space.
+			state = initialState{}
+			header, plain, nonce, pn, hp, aead, err = unprotectInitial(b, h, state)
 		}
 	}
-	padding := extra - (width - h.lengthBytes)
-	if padding < 0 {
-		return nil, state, fmt.Errorf("desync: udplen too small for QUIC length-field growth")
+	if err != nil {
+		return nil, originalState, err
 	}
-	length := h.length + uint64(padding)
-	newHeader := append([]byte(nil), header[:h.lengthAt]...)
-	encoded := make([]byte, width)
-	for i := width - 1; i >= 0; i-- {
-		encoded[i] = byte(length)
-		length >>= 8
-	}
-	switch width {
-	case 2:
-		encoded[0] |= 0x40
-	case 4:
-		encoded[0] |= 0x80
-	case 8:
-		encoded[0] |= 0xc0
-	}
-	newHeader = append(newHeader, encoded...)
-	pnAt := len(newHeader)
-	newHeader = append(newHeader, header[h.pnAt:]...)
-	plain = append(plain, make([]byte, padding)...)
-	out := append([]byte(nil), newHeader...)
-	out = aead.Seal(out, nonce, plain, newHeader)
-	mask := make([]byte, 16)
-	hp.Encrypt(mask, out[pnAt+4:pnAt+20])
-	out[0] ^= mask[0] & 15
-	for i := pnAt; i < len(newHeader); i++ {
-		out[i] ^= mask[i-pnAt+1]
-	}
-	out = append(out, b[h.end:]...)
 	if !state.seen {
 		state.dcid = string(h.dcid)
 	}
@@ -236,7 +211,91 @@ func padQUICInitial(b []byte, extra int, state initialState) ([]byte, initialSta
 		state.largest = pn
 	}
 	state.seen = true
+
+	changed := false
+	if split != "" || order != "" {
+		plain, changed, err = rewriteQUICCrypto(plain, split, order)
+		if err != nil {
+			return nil, originalState, err
+		}
+	}
+	if !changed && extra == 0 {
+		return b, state, nil
+	}
+
+	pnLen := len(header) - h.pnAt
+	tail := b[h.end:]
+	target := len(b) + extra
+	// Existing padding pays for new frame headers first. Small synthetic Initials
+	// may grow up to 1200, but never implicitly enlarge an existing MTU-sized
+	// datagram. udplen explicitly supplies additional space above that budget.
+	limit := min(65507, max(1200, target))
+	width := h.lengthBytes
+	for {
+		minimum := h.lengthAt + width + pnLen + len(plain) + aead.Overhead() + len(tail)
+		if minimum > target {
+			if !changed {
+				return nil, originalState, fmt.Errorf("desync: udplen too small for QUIC length-field growth")
+			}
+			if minimum > limit {
+				return nil, originalState, fmt.Errorf("desync: insufficient QUIC padding for CRYPTO split within datagram size budget")
+			}
+			target = minimum
+		}
+		length := target - len(tail) - h.lengthAt - width
+		if uint64(length) < uint64(1)<<uint(width*8-2) {
+			break
+		}
+		width *= 2
+		if width > 8 {
+			return nil, originalState, fmt.Errorf("desync: QUIC length overflow")
+		}
+	}
+	length := target - len(tail) - h.lengthAt - width
+	padding := length - pnLen - aead.Overhead() - len(plain)
+	if padding < 0 {
+		return nil, originalState, fmt.Errorf("desync: udplen too small for QUIC length-field growth")
+	}
+	newHeader := append([]byte(nil), header[:h.lengthAt]...)
+	newHeader = appendQUICVarintWidth(newHeader, uint64(length), width)
+	pnAt := len(newHeader)
+	newHeader = append(newHeader, header[h.pnAt:]...)
+	plain = append(plain, make([]byte, padding)...)
+	out := aead.Seal(append([]byte(nil), newHeader...), nonce, plain, newHeader)
+	mask := make([]byte, 16)
+	hp.Encrypt(mask, out[pnAt+4:pnAt+20])
+	out[0] ^= mask[0] & 15
+	for i := pnAt; i < len(newHeader); i++ {
+		out[i] ^= mask[i-pnAt+1]
+	}
+	out = append(out, tail...)
 	return out, state, nil
+}
+
+func appendQUICVarintWidth(b []byte, value uint64, width int) []byte {
+	at := len(b)
+	b = append(b, make([]byte, width)...)
+	for i := at + width - 1; i >= at; i-- {
+		b[i] = byte(value)
+		value >>= 8
+	}
+	switch width {
+	case 2:
+		b[at] |= 0x40
+	case 4:
+		b[at] |= 0x80
+	case 8:
+		b[at] |= 0xc0
+	}
+	return b
+}
+
+func appendQUICVarint(b []byte, value uint64) []byte {
+	width := 1
+	for value >= uint64(1)<<uint(width*8-2) {
+		width *= 2
+	}
+	return appendQUICVarintWidth(b, value, width)
 }
 func fakeQUICInitial(b []byte) []byte {
 	h, err := initialPacket(b)

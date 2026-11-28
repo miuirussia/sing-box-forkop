@@ -79,8 +79,13 @@ func TestDesyncResolvedAndSniffedHostsLearnSeparately(t *testing.T) {
 		for key, entry := range stats.Entries {
 			if strings.HasPrefix(key, "host:"+net.JoinHostPort(host, fmt.Sprint(actual.Port))+"|") {
 				found = true
-				if entry.Strategies["none"].Success != 1 {
+				if len(entry.Strategies) != 1 {
 					t.Fatalf("host statistics merged: %s %+v", key, entry)
+				}
+				for id, score := range entry.Strategies {
+					if !strings.HasPrefix(id, "none:") || score.Success != 1 {
+						t.Fatalf("host statistics merged: %s %+v", key, entry)
+					}
 				}
 			}
 		}

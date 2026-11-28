@@ -170,7 +170,7 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 }
 func (h *Outbound) DesyncStats() Snapshot {
 	if h.adaptive == nil {
-		return Snapshot{Version: 1, Current: h.options.Mode, Reason: "manual strategy"}
+		return Snapshot{Version: 1, Current: strategyID(h.options), Reason: "manual strategy"}
 	}
 	return h.adaptive.Stats()
 }

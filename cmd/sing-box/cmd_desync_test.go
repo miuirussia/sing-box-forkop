@@ -16,7 +16,7 @@ import (
 )
 
 func TestDesyncCLIConversion(t *testing.T) {
-	for _, args := range [][]string{{"capabilities"}, {"import", "preset=auto auto_tune=false"}, {"check", `{"preset":"split"}`}, {"export", `{"preset":"GT2","udp_keep_socket":false}`}} {
+	for _, args := range [][]string{{"capabilities"}, {"import", "preset=auto auto_tune=false"}, {"check", `{"preset":"split"}`}, {"export", `{"preset":"GT2","udp_keep_socket":false}`}, {"check", `{"mode":"fake_split","tlsrec_first":true,"tlsrec_pos":"midsld","split_pos":"sni+1,endhost-1","segment_order":"2,1,3","fake_placement":"between","fake_delay":"0s","fake_tls_random":true,"fake_tls_size":4096,"fake_tls_template":"compact","http_mod":"hcsmix,rmspace","udp_mode":"quic","quic_split_pos":"1,midsld","quic_order":"reverse"}`}} {
 		cmd := newDesyncCommand()
 		var out bytes.Buffer
 		cmd.SetOut(&out)
